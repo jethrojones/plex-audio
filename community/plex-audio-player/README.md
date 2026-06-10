@@ -27,8 +27,7 @@ It is designed as the first provider in a broader personal-audio pattern. The co
 This Ability can connect to Plex in three ways:
 
 1. **Manual URL override**: set `plex_base_url` to a reachable Plex server URL, such as `http://192.168.1.20:32400` or a working remote `plex.direct` URL.
-2. **LAN discovery**: leave `plex_base_url` empty and run the Ability on a local DevKit/device on the same network as Plex. The Ability will try Plex GDM multicast discovery.
-3. **Plex.tv resource discovery**: set `plex_account_token` so the Ability can ask Plex.tv for the server's advertised connection URLs, including custom server access URLs.
+2. **Plex.tv resource discovery**: set `plex_account_token` so the Ability can ask Plex.tv for the server's advertised connection URLs, including custom server access URLs. OpenHome blocks raw `socket` imports, so multicast LAN discovery is not available inside this Ability.
 
 Recommended OpenHome custom API key values:
 
@@ -70,7 +69,7 @@ Provider URL suggestion for the OpenHome key setup screen:
 ## How It Works
 
 1. The user triggers the Ability and asks for music or an audiobook.
-2. The Ability first uses `plex_base_url` if present. Otherwise it tries local Plex GDM discovery, then Plex.tv resource discovery with `plex_account_token`.
+2. The Ability first uses `plex_base_url` if present. Otherwise it tries Plex.tv resource discovery with `plex_account_token`.
 3. It searches Plex for audio tracks using Plex's XML API.
 4. It filters to `Track` media and infers music vs audiobook from library metadata and duration.
 5. It picks the best match for the spoken request.

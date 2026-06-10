@@ -1,6 +1,5 @@
 import collections
 import re
-import socket
 import time
 import xml.etree.ElementTree as ET
 
@@ -15,9 +14,6 @@ PLEX_ACCOUNT_TOKEN_KEY = "plex_account_token"
 PLEX_SERVER_NAME_KEY = "plex_server_name"
 PLEX_MACHINE_IDENTIFIER_KEY = "plex_machine_identifier"
 REQUEST_TIMEOUT = 15
-GDM_TIMEOUT = 2
-GDM_MULTICAST_ADDR = "239.0.0.250"
-GDM_PORT = 32414
 STREAM_CHUNK_SIZE = 64 * 1024
 AUDIO_SEARCH_TYPE = "10"
 RESUME_STATE_KEY = "plex_audio_last_audiobook"
@@ -250,59 +246,6 @@ def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None,
                     "local": local_flag,
                 }
             )
-    return choose_best_plex_connection(connections, preferred_subnets)
-
-
-def parse_gdm_response(payload, address):
-    headers = {}
-    for raw_line in str(payload or "").replace("\r", "").split("\n"):
-        if ":" not in raw_line:
-            continue
-        key, value = raw_line.split(":", 1)
-        headers[key.strip().lower()] = value.strip()
-    if headers.get("content-type") != "plex/media-server":
-        return None
-    host = str(address[0] if address else "").strip()
-    port = headers.get("port") or "32400"
-    if not host:
-        host = headers.get("host") or ""
-    if not host:
-        return None
-    return {
-        "base_url": "http://" + host + ":" + str(port).strip(),
-        "token": "",
-        "name": headers.get("name") or "",
-        "machine_identifier": headers.get("resource-identifier") or "",
-        "local": True,
-    }
-
-
-def discover_plex_gdm(server_name=None, machine_identifier=None, preferred_subnets=None, logger=None):
-    connections = []
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(GDM_TIMEOUT)
-        message = b"M-SEARCH * HTTP/1.0\r\n\r\n"
-        sock.sendto(message, (GDM_MULTICAST_ADDR, GDM_PORT))
-        deadline = time.monotonic() + GDM_TIMEOUT
-        while time.monotonic() < deadline:
-            try:
-                data, address = sock.recvfrom(4096)
-            except socket.timeout:
-                break
-            connection = parse_gdm_response(data.decode("utf-8", "ignore"), address)
-            if connection and _connection_matches(connection, server_name, machine_identifier):
-                connections.append(connection)
-    except Exception as exc:
-        if logger:
-            logger.warning(f"[PlexAudio] Plex LAN discovery failed: {exc}")
-    finally:
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
     return choose_best_plex_connection(connections, preferred_subnets)
 
 
@@ -570,20 +513,13 @@ class PlexAudioPlayerCapability(MatchingCapability):
         if base_url:
             return PlexAudioClient(base_url, token, logger)
 
-        connection = discover_plex_gdm(
+        connection = discover_plex_tv_resource(
+            account_token,
             server_name=server_name,
             machine_identifier=machine_identifier,
             preferred_subnets=self._preferred_subnets(),
             logger=logger,
         )
-        if not connection:
-            connection = discover_plex_tv_resource(
-                account_token,
-                server_name=server_name,
-                machine_identifier=machine_identifier,
-                preferred_subnets=self._preferred_subnets(),
-                logger=logger,
-            )
         if connection:
             return PlexAudioClient(connection.get("base_url"), connection.get("token") or token, logger)
         return None

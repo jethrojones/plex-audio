@@ -314,24 +314,12 @@ def test_parse_plex_tv_resources_can_match_machine_identifier():
     assert connection["token"] == "right-token"
 
 
-def test_parse_gdm_response_extracts_plex_media_server_connection():
-    mod = load_ability_module()
-    payload = """HTTP/1.0 200 OK\r
-Content-Type: plex/media-server\r
-Name: ombee\r
-Host: 10-0-0-136.plex.direct\r
-Port: 32400\r
-Resource-Identifier: acdc74e9\r
-\r
-"""
 
-    connection = mod.parse_gdm_response(payload, ("10.0.0.136", 32414))
+def test_ability_main_avoids_forbidden_socket_import():
+    source = (Path(__file__).resolve().parents[1] / "community" / "plex-audio-player" / "main.py").read_text()
 
-    assert connection["name"] == "ombee"
-    assert connection["machine_identifier"] == "acdc74e9"
-    assert connection["base_url"] == "http://10.0.0.136:32400"
-    assert connection["token"] == ""
-
+    assert "import socket" not in source
+    assert "socket." not in source
 
 def test_choose_best_connection_prefers_matching_preferred_subnet():
     mod = load_ability_module()
