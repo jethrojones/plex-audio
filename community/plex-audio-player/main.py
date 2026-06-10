@@ -1,5 +1,6 @@
 import collections
 import re
+import socket
 import time
 import xml.etree.ElementTree as ET
 
@@ -10,7 +11,13 @@ from src.agent.capability_worker import CapabilityWorker
 
 PLEX_BASE_URL_KEY = "plex_base_url"
 PLEX_TOKEN_KEY = "plex_token"
+PLEX_ACCOUNT_TOKEN_KEY = "plex_account_token"
+PLEX_SERVER_NAME_KEY = "plex_server_name"
+PLEX_MACHINE_IDENTIFIER_KEY = "plex_machine_identifier"
 REQUEST_TIMEOUT = 15
+GDM_TIMEOUT = 2
+GDM_MULTICAST_ADDR = "239.0.0.250"
+GDM_PORT = 32414
 STREAM_CHUNK_SIZE = 64 * 1024
 AUDIO_SEARCH_TYPE = "10"
 RESUME_STATE_KEY = "plex_audio_last_audiobook"
@@ -162,6 +169,158 @@ def _encode_query(query):
     return "&".join(parts)
 
 
+def _url_host(url):
+    text = str(url or "")
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    return text.split("/", 1)[0].split(":", 1)[0]
+
+
+def _url_is_local(url):
+    host = _url_host(url)
+    return (
+        host.startswith("10.")
+        or host.startswith("192.168.")
+        or host.startswith("172.16.")
+        or host.startswith("172.17.")
+        or host.startswith("172.18.")
+        or host.startswith("172.19.")
+        or host.startswith("172.20.")
+        or host.startswith("172.21.")
+        or host.startswith("172.22.")
+        or host.startswith("172.23.")
+        or host.startswith("172.24.")
+        or host.startswith("172.25.")
+        or host.startswith("172.26.")
+        or host.startswith("172.27.")
+        or host.startswith("172.28.")
+        or host.startswith("172.29.")
+        or host.startswith("172.30.")
+        or host.startswith("172.31.")
+        or host in {"localhost", "127.0.0.1"}
+    )
+
+
+def _connection_matches(connection, server_name=None, machine_identifier=None):
+    if server_name and str(connection.get("name") or "").lower() != str(server_name).lower():
+        return False
+    if machine_identifier and str(connection.get("machine_identifier") or "") != str(machine_identifier):
+        return False
+    return True
+
+
+def choose_best_plex_connection(connections, preferred_subnets=None):
+    candidates = [conn for conn in connections if conn and conn.get("base_url")]
+    if not candidates:
+        return None
+    prefixes = [str(prefix) for prefix in (preferred_subnets or []) if prefix]
+    for prefix in prefixes:
+        for conn in candidates:
+            if _url_host(conn.get("base_url", "")).startswith(prefix):
+                return conn
+    for conn in candidates:
+        if conn.get("local") or _url_is_local(conn.get("base_url")):
+            return conn
+    return candidates[0]
+
+
+def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None, preferred_subnets=None):
+    if not xml_text:
+        return None
+    root = ET.fromstring(xml_text)
+    connections = []
+    for device in root.findall(".//Device"):
+        name = device.attrib.get("name") or device.attrib.get("clientIdentifier") or ""
+        client_identifier = device.attrib.get("clientIdentifier") or ""
+        token = device.attrib.get("accessToken") or ""
+        device_data = {"name": name, "machine_identifier": client_identifier}
+        if not _connection_matches(device_data, server_name, machine_identifier):
+            continue
+        for connection in device.findall(".//Connection"):
+            uri = connection.attrib.get("uri") or ""
+            if not uri:
+                continue
+            local_flag = str(connection.attrib.get("local") or "").lower() in {"1", "true", "yes"}
+            connections.append(
+                {
+                    "base_url": uri.rstrip("/"),
+                    "token": token,
+                    "name": name,
+                    "machine_identifier": client_identifier,
+                    "local": local_flag,
+                }
+            )
+    return choose_best_plex_connection(connections, preferred_subnets)
+
+
+def parse_gdm_response(payload, address):
+    headers = {}
+    for raw_line in str(payload or "").replace("\r", "").split("\n"):
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    if headers.get("content-type") != "plex/media-server":
+        return None
+    host = str(address[0] if address else "").strip()
+    port = headers.get("port") or "32400"
+    if not host:
+        host = headers.get("host") or ""
+    if not host:
+        return None
+    return {
+        "base_url": "http://" + host + ":" + str(port).strip(),
+        "token": "",
+        "name": headers.get("name") or "",
+        "machine_identifier": headers.get("resource-identifier") or "",
+        "local": True,
+    }
+
+
+def discover_plex_gdm(server_name=None, machine_identifier=None, preferred_subnets=None, logger=None):
+    connections = []
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(GDM_TIMEOUT)
+        message = b"M-SEARCH * HTTP/1.0\r\n\r\n"
+        sock.sendto(message, (GDM_MULTICAST_ADDR, GDM_PORT))
+        deadline = time.monotonic() + GDM_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                data, address = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            connection = parse_gdm_response(data.decode("utf-8", "ignore"), address)
+            if connection and _connection_matches(connection, server_name, machine_identifier):
+                connections.append(connection)
+    except Exception as exc:
+        if logger:
+            logger.warning(f"[PlexAudio] Plex LAN discovery failed: {exc}")
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return choose_best_plex_connection(connections, preferred_subnets)
+
+
+def discover_plex_tv_resource(account_token, server_name=None, machine_identifier=None, preferred_subnets=None, logger=None):
+    token = str(account_token or "").strip()
+    if not token:
+        return None
+    try:
+        url = "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&X-Plex-Token=" + _url_quote(token)
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return parse_plex_tv_resources(response.text, server_name, machine_identifier, preferred_subnets)
+    except Exception as exc:
+        if logger:
+            logger.warning(f"[PlexAudio] Plex.tv resource discovery failed: {exc}")
+    return None
+
+
 def _plex_url(client, path, params=None):
     raw_path = str(path or "")
     if raw_path.startswith("http://") or raw_path.startswith("https://"):
@@ -173,9 +332,13 @@ def _plex_url(client, path, params=None):
     query = _parse_query(existing_query)
     if params:
         query.update({str(key): str(value) for key, value in params.items() if value is not None})
-    query["X-Plex-Token"] = client.token
+    if client.token:
+        query["X-Plex-Token"] = client.token
 
-    url = base + "?" + _encode_query(query)
+    if query:
+        url = base + "?" + _encode_query(query)
+    else:
+        url = base
     if fragment:
         url += "#" + fragment
     return url
@@ -377,15 +540,53 @@ class PlexAudioPlayerCapability(MatchingCapability):
         self.capability_worker = CapabilityWorker(self)
         self.worker.session_tasks.create(self.run())
 
+    def _get_optional_api_key(self, key):
+        try:
+            return self.capability_worker.get_api_keys(key)
+        except Exception:
+            return ""
+
     def _get_required_config(self):
-        base_url = self.capability_worker.get_api_keys(PLEX_BASE_URL_KEY)
-        token = self.capability_worker.get_api_keys(PLEX_TOKEN_KEY)
+        base_url = self._get_optional_api_key(PLEX_BASE_URL_KEY)
+        token = self._get_optional_api_key(PLEX_TOKEN_KEY)
+        account_token = self._get_optional_api_key(PLEX_ACCOUNT_TOKEN_KEY)
+        server_name = self._get_optional_api_key(PLEX_SERVER_NAME_KEY)
+        machine_identifier = self._get_optional_api_key(PLEX_MACHINE_IDENTIFIER_KEY)
         missing = []
-        if not base_url:
-            missing.append(PLEX_BASE_URL_KEY)
-        if not token:
-            missing.append(PLEX_TOKEN_KEY)
-        return base_url, token, missing
+        if not base_url and not account_token:
+            # LAN GDM discovery can still work with no keys when the runtime is on the same network.
+            # Keep this non-blocking so local/no-auth Plex setups do not require dummy credentials.
+            missing = []
+        return base_url, token, account_token, server_name, machine_identifier, missing
+
+    def _preferred_subnets(self):
+        subnets = []
+        for value in ["10.", "192.168."]:
+            subnets.append(value)
+        return subnets
+
+    def _resolve_client(self, base_url, token, account_token, server_name, machine_identifier):
+        logger = self.worker.editor_logging_handler
+        if base_url:
+            return PlexAudioClient(base_url, token, logger)
+
+        connection = discover_plex_gdm(
+            server_name=server_name,
+            machine_identifier=machine_identifier,
+            preferred_subnets=self._preferred_subnets(),
+            logger=logger,
+        )
+        if not connection:
+            connection = discover_plex_tv_resource(
+                account_token,
+                server_name=server_name,
+                machine_identifier=machine_identifier,
+                preferred_subnets=self._preferred_subnets(),
+                logger=logger,
+            )
+        if connection:
+            return PlexAudioClient(connection.get("base_url"), connection.get("token") or token, logger)
+        return None
 
     async def _get_initial_request(self):
         try:
@@ -445,14 +646,20 @@ class PlexAudioPlayerCapability(MatchingCapability):
     async def run(self):
         base_url = ""
         try:
-            base_url, token, missing = self._get_required_config()
+            base_url, token, account_token, server_name, machine_identifier, missing = self._get_required_config()
             if missing:
                 await self.capability_worker.speak(
-                    "Plex Audio Player needs setup first. Add plex base url and plex token in OpenHome Settings under API Keys."
+                    "Plex Audio Player needs setup first. Add a Plex base URL, or add a Plex account token for discovery."
                 )
                 return
 
-            client = PlexAudioClient(base_url, token, self.worker.editor_logging_handler)
+            client = self._resolve_client(base_url, token, account_token, server_name, machine_identifier)
+            if not client:
+                await self.capability_worker.speak(
+                    "I could not find your Plex server. Add plex base url, or add a Plex account token and server name for discovery."
+                )
+                return
+            base_url = client.base_url
             user_request = await self._get_initial_request()
             if not user_request or exit_requested(user_request):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")

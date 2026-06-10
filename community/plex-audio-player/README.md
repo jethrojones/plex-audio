@@ -24,10 +24,19 @@ It is designed as the first provider in a broader personal-audio pattern. The co
 
 ## Setup
 
-This Ability requires two OpenHome custom API key values. In the OpenHome dashboard, declare and tag both as required under **Ability Behavior → API Keys**:
+This Ability can connect to Plex in three ways:
 
-- `plex_base_url` — the base URL for the user's Plex server, for example `https://your-plex.example.com` or `http://192.168.1.20:32400`
-- `plex_token` — the user's Plex authentication token
+1. **Manual URL override**: set `plex_base_url` to a reachable Plex server URL, such as `http://192.168.1.20:32400` or a working remote `plex.direct` URL.
+2. **LAN discovery**: leave `plex_base_url` empty and run the Ability on a local DevKit/device on the same network as Plex. The Ability will try Plex GDM multicast discovery.
+3. **Plex.tv resource discovery**: set `plex_account_token` so the Ability can ask Plex.tv for the server's advertised connection URLs, including custom server access URLs.
+
+Recommended OpenHome custom API key values:
+
+- `plex_base_url` — optional manual base URL for the user's Plex server.
+- `plex_token` — optional server auth token. This is not required if Plex allows the DevKit subnet under **Settings → Server → Network → List of IP addresses and networks that are allowed without auth**.
+- `plex_account_token` — optional Plex account token for Plex.tv resource discovery.
+- `plex_server_name` — optional Plex server name to choose when the Plex account has multiple servers.
+- `plex_machine_identifier` — optional Plex machine identifier to choose one exact server.
 
 ### Important Network Note
 
@@ -56,11 +65,12 @@ Provider URL suggestion for the OpenHome key setup screen:
 
 - `plex_base_url`: `https://support.plex.tv/articles/200289506-remote-access/`
 - `plex_token`: `https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/`
+- `plex_account_token`: `https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/`
 
 ## How It Works
 
 1. The user triggers the Ability and asks for music or an audiobook.
-2. The Ability reads `plex_base_url` and `plex_token` with `get_api_keys()`.
+2. The Ability first uses `plex_base_url` if present. Otherwise it tries local Plex GDM discovery, then Plex.tv resource discovery with `plex_account_token`.
 3. It searches Plex for audio tracks using Plex's XML API.
 4. It filters to `Track` media and infers music vs audiobook from library metadata and duration.
 5. It picks the best match for the spoken request.
@@ -97,7 +107,7 @@ This first version supports:
 - Natural-language search requests
 - Music vs audiobook preference based on the request
 - Audio streaming from Plex media parts
-- Clear setup errors for missing server URL or token
+- Clear setup errors for missing/unreachable Plex discovery configuration
 
 ### Resume Behavior
 
