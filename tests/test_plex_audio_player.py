@@ -1,0 +1,193 @@
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+
+def load_ability_module():
+    # Stub OpenHome modules so helper functions/classes can be tested locally.
+    src = types.ModuleType("src")
+    agent = types.ModuleType("src.agent")
+    capability = types.ModuleType("src.agent.capability")
+    main_mod = types.ModuleType("src.main")
+    capability_worker = types.ModuleType("src.agent.capability_worker")
+
+    class MatchingCapability:
+        pass
+
+    class AgentWorker:
+        pass
+
+    class CapabilityWorker:
+        def __init__(self, capability):
+            self.capability = capability
+
+    setattr(capability, "MatchingCapability", MatchingCapability)
+    setattr(main_mod, "AgentWorker", AgentWorker)
+    setattr(capability_worker, "CapabilityWorker", CapabilityWorker)
+
+    sys.modules["src"] = src
+    sys.modules["src.agent"] = agent
+    sys.modules["src.agent.capability"] = capability
+    sys.modules["src.main"] = main_mod
+    sys.modules["src.agent.capability_worker"] = capability_worker
+
+    path = Path(__file__).resolve().parents[1] / "community" / "plex-audio-player" / "main.py"
+    spec = importlib.util.spec_from_file_location("plex_audio_player_main", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_plex_url_adds_token_and_params():
+    mod = load_ability_module()
+    client = mod.PlexAudioClient("http://plex.example:32400/", "abc123")
+
+    url = client.url("/library/sections", {"type": "10", "query": "Miles Davis"})
+
+    assert url.startswith("http://plex.example:32400/library/sections?")
+    assert "X-Plex-Token=abc123" in url
+    assert "type=10" in url
+    assert "query=Miles+Davis" in url
+
+
+def test_plex_url_preserves_existing_query_params():
+    mod = load_ability_module()
+    client = mod.PlexAudioClient("https://plex.example", "tok")
+
+    url = client.url("/library/parts/99?download=1", {"X-Plex-Client-Identifier": "openhome"})
+
+    assert url.startswith("https://plex.example/library/parts/99?")
+    assert "download=1" in url
+    assert "X-Plex-Client-Identifier=openhome" in url
+    assert "X-Plex-Token=tok" in url
+
+
+def test_parse_tracks_extracts_music_and_audiobook_metadata():
+    mod = load_ability_module()
+    client = mod.PlexAudioClient("http://plex", "tok")
+    xml = """
+    <MediaContainer>
+      <Track title="So What" grandparentTitle="Miles Davis" parentTitle="Kind of Blue" librarySectionTitle="Music">
+        <Media duration="545000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="Chapter 1" grandparentTitle="The Hobbit" parentTitle="J. R. R. Tolkien" librarySectionTitle="Audiobooks" ratingKey="abc123">
+        <Media duration="3600000"><Part key="/library/parts/2/file.m4b" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    items = client.parse_tracks(xml)
+
+    assert len(items) == 2
+    assert items[0].title == "So What"
+    assert items[0].creator == "Miles Davis"
+    assert items[0].collection == "Kind of Blue"
+    assert items[0].media_type == "music"
+    assert items[0].part_key == "/library/parts/1/file.mp3"
+    assert items[1].media_type == "audiobook"
+    assert items[1].title == "Chapter 1"
+    assert items[1].creator == "The Hobbit"
+
+
+def test_choose_best_item_prefers_requested_audiobook():
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Song called Dune", "Band", "Album", "music", "/song.mp3", 180000, "song1"),
+        mod.PlexAudioItem("Chapter 1", "Dune", "Frank Herbert", "audiobook", "/dune.m4b", 3600000, "book1"),
+    ]
+
+    choice = mod.choose_best_item(items, "play the audiobook Dune")
+
+    assert choice.part_key == "/dune.m4b"
+
+
+def test_choose_best_item_prefers_requested_music():
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Chapter 1", "Blue", "Author", "audiobook", "/book.m4b", 3600000, "book1"),
+        mod.PlexAudioItem("Blue in Green", "Miles Davis", "Kind of Blue", "music", "/blue.mp3", 320000, "song1"),
+    ]
+
+    choice = mod.choose_best_item(items, "play music blue in green")
+
+    assert choice.part_key == "/blue.mp3"
+
+
+def test_choose_best_item_returns_none_for_empty_results():
+    mod = load_ability_module()
+
+    assert mod.choose_best_item([], "play something") is None
+
+
+def test_sanitize_search_query_removes_provider_words():
+    mod = load_ability_module()
+
+    assert mod.sanitize_search_query("play the audiobook The Hobbit from Plex") == "The Hobbit"
+    assert mod.sanitize_search_query("plex music Miles Davis") == "Miles Davis"
+
+
+def test_resume_requested_detects_continue_my_audiobook_phrases():
+    mod = load_ability_module()
+
+    assert mod.resume_requested("continue my audiobook")
+    assert mod.resume_requested("resume my book")
+    assert mod.resume_requested("pick up where I left off in Plex")
+    assert not mod.resume_requested("play the audiobook Dune")
+
+
+def test_stream_url_for_resume_adds_offset_parameter():
+    mod = load_ability_module()
+    client = mod.PlexAudioClient("https://plex.example", "tok")
+    item = mod.PlexAudioItem("Chapter 1", "Dune", "Frank Herbert", "audiobook", "/library/parts/7/file.m4b", 3600000, "rating7")
+
+    url = client.stream_url_for(item, offset_ms=125000)
+
+    assert "offset=125" in url
+    assert "X-Plex-Token=tok" in url
+
+
+def test_build_resume_state_only_stores_audiobooks():
+    mod = load_ability_module()
+    book = mod.PlexAudioItem("Chapter 1", "Dune", "Frank Herbert", "audiobook", "/dune.m4b", 3600000, "rating7")
+    song = mod.PlexAudioItem("So What", "Miles Davis", "Kind of Blue", "music", "/song.mp3", 545000, "song1")
+
+    state = mod.build_resume_state(book, offset_ms=90000)
+
+    assert state["title"] == "Chapter 1"
+    assert state["creator"] == "Dune"
+    assert state["offset_ms"] == 90000
+    assert state["part_key"] == "/dune.m4b"
+    assert mod.build_resume_state(song, offset_ms=90000) is None
+
+
+def test_item_from_resume_state_rehydrates_audiobook():
+    mod = load_ability_module()
+    state = {
+        "title": "Chapter 2",
+        "creator": "Dune",
+        "collection": "Frank Herbert",
+        "media_type": "audiobook",
+        "part_key": "/dune2.m4b",
+        "duration_ms": 3600000,
+        "rating_key": "rating8",
+        "offset_ms": 120000,
+    }
+
+    item = mod.item_from_resume_state(state)
+
+    assert item.title == "Chapter 2"
+    assert item.media_type == "audiobook"
+    assert item.part_key == "/dune2.m4b"
+
+
+def test_update_resume_offset_clamps_near_end_to_zero():
+    mod = load_ability_module()
+    state = {"duration_ms": 3600000, "offset_ms": 3590000}
+
+    updated = mod.updated_resume_state(state, elapsed_ms=30000)
+
+    assert updated["offset_ms"] == 0
