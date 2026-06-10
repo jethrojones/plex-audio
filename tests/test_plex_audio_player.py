@@ -247,3 +247,21 @@ def test_update_resume_offset_clamps_near_end_to_zero():
     updated = mod.updated_resume_state(state, elapsed_ms=30000)
 
     assert updated["offset_ms"] == 0
+
+
+def test_plex_error_message_explains_network_timeout_for_lan_url():
+    mod = load_ability_module()
+    message = mod.plex_error_message(
+        "http://192.168.0.20:32400",
+        Exception("Connection to 192.168.0.20 timed out"),
+    )
+
+    assert "cannot reach your Plex server" in message
+    assert "remote Plex URL" in message
+
+
+def test_plex_error_message_explains_unauthorized_token():
+    mod = load_ability_module()
+    message = mod.plex_error_message("https://plex.example", Exception("401 Unauthorized"))
+
+    assert "token" in message.lower()

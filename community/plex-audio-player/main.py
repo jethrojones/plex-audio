@@ -349,6 +349,21 @@ def updated_resume_state(state, elapsed_ms):
     return updated
 
 
+def plex_error_message(base_url, exc):
+    error_text = str(exc or "").lower()
+    base_text = str(base_url or "")
+    if "401" in error_text or "unauthorized" in error_text:
+        return "Plex rejected the token. Check the plex token API key and try again."
+    if "timed out" in error_text or "connecttimeout" in error_text or "connection refused" in error_text:
+        if "192.168." in base_text or "10." in base_text or "172." in base_text or "localhost" in base_text:
+            return (
+                "OpenHome cannot reach your Plex server at that local network address. "
+                "Use a local DevKit on the same network, or enable Plex Remote Access and set plex base url to a remote Plex URL."
+            )
+        return "OpenHome cannot reach your Plex server. Check that the plex base url is online and reachable."
+    return "Sorry, Plex playback did not work. Check that your Plex server URL is reachable and your token is valid."
+
+
 class PlexAudioPlayerCapability(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
@@ -427,6 +442,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Resume save failed: {exc}")
 
     async def run(self):
+        base_url = ""
         try:
             base_url, token, missing = self._get_required_config()
             if missing:
@@ -472,8 +488,6 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
         except Exception as exc:
             self.worker.editor_logging_handler.error(f"[PlexAudio] Error: {exc}")
-            await self.capability_worker.speak(
-                "Sorry, Plex playback did not work. Check that your Plex server URL is reachable and your token is valid."
-            )
+            await self.capability_worker.speak(plex_error_message(base_url, exc))
         finally:
             self.capability_worker.resume_normal_flow()

@@ -33,17 +33,28 @@ This Ability requires two OpenHome custom API key values. In the OpenHome dashbo
 
 The OpenHome runtime must be able to reach `plex_base_url`.
 
-- If OpenHome is running in the cloud, use a secure remote Plex URL that is reachable from the internet.
+- If OpenHome is running in the cloud or Live Editor, a LAN/private URL such as `http://192.168.x.x:32400` will usually time out. Use a secure remote Plex URL that is reachable from the internet.
 - If OpenHome is running on a local DevKit or device on the same network as Plex, a LAN URL such as `http://192.168.x.x:32400` can work.
 - Do not publish a real Plex token or private home URL in this repo.
 
+### Plex Remote Access Setup
+
+Plex's Remote Access documentation says to enable outside-network access under **Settings → Server → Remote Access** in Plex Web App. Remote Access requires the Plex Media Server to be signed in to a Plex account. Plex can try automatic router setup with UPnP/NAT-PMP, or you can manually forward a public TCP port to the server's internal port `32400`.
+
+If you manually forward a port, Plex says you must also enable **Manually specify public port** on the Remote Access screen and enter the external port, then retry the connection. The status should show that the server is fully accessible outside the network before using that remote URL in OpenHome cloud/Live Editor.
+
+Quick reachability checks:
+
+- `http://LAN-IP:32400/identity?X-Plex-Token=TOKEN` should work from a local DevKit on the same network.
+- The remote `https://...plex.direct:PORT/identity?X-Plex-Token=TOKEN` URL should work from outside the network before using it in OpenHome cloud/Live Editor.
+
 ### Getting a Plex Token
 
-Plex tokens can be found through Plex's official support instructions. In short, sign in to Plex, inspect XML/details for owned media, and copy the `X-Plex-Token` value. Treat it like a password.
+Plex's token documentation says authenticated server endpoints use the `X-Plex-Token` URL parameter, for example `http://localhost:32400/?X-Plex-Token=YOURTOKENVALUEHERE`. To find a token, sign in to Plex Web App, browse to a library item, view XML for it, and copy the `X-Plex-Token` value from the URL. Treat it like a password.
 
 Provider URL suggestion for the OpenHome key setup screen:
 
-- `plex_base_url`: `https://support.plex.tv/articles/200288586-installation/`
+- `plex_base_url`: `https://support.plex.tv/articles/200289506-remote-access/`
 - `plex_token`: `https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/`
 
 ## How It Works
