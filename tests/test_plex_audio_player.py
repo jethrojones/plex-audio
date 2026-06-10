@@ -184,6 +184,7 @@ def test_sanitize_search_query_removes_provider_words():
     assert mod.sanitize_search_query("play the audiobook The Hobbit from Plex") == "The Hobbit"
     assert mod.sanitize_search_query("plex music Miles Davis") == "Miles Davis"
     assert mod.sanitize_search_query("Play some Metallica for myPlex library.") == "Metallica"
+    assert mod.sanitize_search_query("play Metallica on plex") == "Metallica"
 
 
 def test_resume_requested_detects_continue_my_audiobook_phrases():

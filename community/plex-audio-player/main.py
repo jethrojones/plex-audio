@@ -54,6 +54,7 @@ def sanitize_search_query(user_text):
         r"\bfor\s+my\s*plex\s+library\b",
         r"\bmy\s*plex\s+library\b",
         r"\bfrom plex\b",
+        r"\bon plex\b",
         r"\bplex\b",
         r"\blibrary\b",
         r"\bthe audiobook\b",
