@@ -1,7 +1,7 @@
+import collections
 import re
 import time
-from collections import namedtuple
-from urllib.parse import urlencode, urljoin, urlparse, parse_qsl, urlunparse
+import urllib.parse
 import xml.etree.ElementTree as ET
 
 import requests
@@ -18,12 +18,12 @@ RESUME_STATE_KEY = "plex_audio_last_audiobook"
 RESUME_END_THRESHOLD_MS = 60 * 1000
 EXIT_WORDS = {"stop", "exit", "quit", "cancel", "nevermind", "never mind", "done", "bye"}
 
-PlexAudioItem = namedtuple(
+PlexAudioItem = collections.namedtuple(
     "PlexAudioItem",
     ["title", "creator", "collection", "media_type", "part_key", "duration_ms", "rating_key"],
 )
 
-PlexAudioClientState = namedtuple(
+PlexAudioClientState = collections.namedtuple(
     "PlexAudioClientState",
     ["base_url", "token", "logger", "url", "get_xml", "parse_tracks", "search_audio", "stream_url_for"],
 )
@@ -119,15 +119,15 @@ def choose_best_item(items, user_text):
 def _plex_url(client, path, params=None):
     raw_path = str(path or "")
     if raw_path.startswith("http://") or raw_path.startswith("https://"):
-        parsed = urlparse(raw_path)
+        parsed = urllib.parse.urlparse(raw_path)
     else:
-        parsed = urlparse(urljoin(client.base_url + "/", raw_path.lstrip("/")))
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        parsed = urllib.parse.urlparse(urllib.parse.urljoin(client.base_url + "/", raw_path.lstrip("/")))
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
     if params:
         query.update({key: value for key, value in params.items() if value is not None})
     query["X-Plex-Token"] = client.token
-    return urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query), parsed.fragment)
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, urllib.parse.urlencode(query), parsed.fragment)
     )
 
 
