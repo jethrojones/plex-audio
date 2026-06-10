@@ -185,6 +185,7 @@ def test_sanitize_search_query_removes_provider_words():
     assert mod.sanitize_search_query("plex music Miles Davis") == "Miles Davis"
     assert mod.sanitize_search_query("Play some Metallica for myPlex library.") == "Metallica"
     assert mod.sanitize_search_query("play Metallica on plex") == "Metallica"
+    assert mod.sanitize_search_query("play metallica in plex") == "metallica"
 
 
 def test_resume_requested_detects_continue_my_audiobook_phrases():
