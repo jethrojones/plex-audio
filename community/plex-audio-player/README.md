@@ -119,4 +119,4 @@ python validate_ability.py community/plex-audio-player
 
 The Ability intentionally uses OpenHome's custom API key mechanism instead of hardcoded secrets. Trigger words are configured in the OpenHome dashboard, not in code.
 
-Packaging note: keep test stubs and helper-only imports out of `main.py`. The OpenHome editor blocks some stdlib `from ... import ...` lines, including `from types import ...` and `from urllib.parse import ...`. This Ability uses plain module imports such as `import urllib.parse` plus `namedtuple`-based data containers in `main.py`; local tests may still use `types.ModuleType` for SDK stubs.
+Packaging note: keep test stubs and helper-only imports out of `main.py`. The OpenHome editor blocks some stdlib modules/import patterns, including `from types import ...`, `from urllib.parse import ...`, and `import urllib.parse`. This Ability avoids `urllib` entirely and uses a tiny local query-string encoder for Plex URLs; local tests may still use `types.ModuleType` for SDK stubs.

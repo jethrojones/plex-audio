@@ -1,7 +1,6 @@
 import collections
 import re
 import time
-import urllib.parse
 import xml.etree.ElementTree as ET
 
 import requests
@@ -27,6 +26,8 @@ PlexAudioClientState = collections.namedtuple(
     "PlexAudioClientState",
     ["base_url", "token", "logger", "url", "get_xml", "parse_tracks", "search_audio", "stream_url_for"],
 )
+
+URL_SAFE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 
 
 def normalize_text(value):
@@ -116,19 +117,59 @@ def choose_best_item(items, user_text):
     return max(items, key=lambda item: score_item(item, user_text, requested_type))
 
 
+def _url_quote(value):
+    encoded = []
+    for char in str(value or ""):
+        if char in URL_SAFE_CHARS:
+            encoded.append(char)
+        elif char == " ":
+            encoded.append("+")
+        else:
+            for byte in char.encode("utf-8"):
+                encoded.append("%" + format(byte, "02X"))
+    return "".join(encoded)
+
+
+def _split_url(url):
+    base_and_query, separator, fragment = str(url or "").partition("#")
+    base, separator, query = base_and_query.partition("?")
+    return base, query, fragment
+
+
+def _parse_query(query_text):
+    query = {}
+    for pair in str(query_text or "").split("&"):
+        if not pair:
+            continue
+        key, separator, value = pair.partition("=")
+        query[key] = value
+    return query
+
+
+def _encode_query(query):
+    parts = []
+    for key, value in query.items():
+        parts.append(_url_quote(key) + "=" + _url_quote(value))
+    return "&".join(parts)
+
+
 def _plex_url(client, path, params=None):
     raw_path = str(path or "")
     if raw_path.startswith("http://") or raw_path.startswith("https://"):
-        parsed = urllib.parse.urlparse(raw_path)
+        full_url = raw_path
     else:
-        parsed = urllib.parse.urlparse(urllib.parse.urljoin(client.base_url + "/", raw_path.lstrip("/")))
-    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        full_url = client.base_url.rstrip("/") + "/" + raw_path.lstrip("/")
+
+    base, existing_query, fragment = _split_url(full_url)
+    query = _parse_query(existing_query)
     if params:
-        query.update({key: value for key, value in params.items() if value is not None})
+        query.update({str(key): str(value) for key, value in params.items() if value is not None})
     query["X-Plex-Token"] = client.token
-    return urllib.parse.urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, urllib.parse.urlencode(query), parsed.fragment)
-    )
+
+    url = base + "?" + _encode_query(query)
+    if fragment:
+        url += "#" + fragment
+    return url
 
 
 def _plex_get_xml(client, path, params=None):
