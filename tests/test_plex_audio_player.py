@@ -123,6 +123,61 @@ def test_choose_best_item_returns_none_for_empty_results():
     assert mod.choose_best_item([], "play something") is None
 
 
+def test_score_item_ignores_titles_that_normalize_to_empty_text():
+    mod = load_ability_module()
+    item = mod.PlexAudioItem("Гимн России", "Lyube", "Рассея", "music", "/song.mp3", 180000, "song1")
+
+    assert mod.score_item(item, "Miles Davis") == 0
+
+
+def test_score_item_does_not_treat_partial_words_as_token_matches():
+    mod = load_ability_module()
+    item = mod.PlexAudioItem("Smiles", "Choir", "Album", "music", "/song.mp3", 180000, "song1")
+
+    assert mod.score_item(item, "Miles Davis") == 0
+
+
+def test_search_audio_falls_back_to_library_scan_for_artist_matches():
+    mod = load_ability_module()
+    sections_xml = """
+    <MediaContainer>
+      <Directory key="6" title="Music" type="artist" />
+    </MediaContainer>
+    """
+    empty_xml = '<MediaContainer size="0" />'
+    all_tracks_xml = """
+    <MediaContainer>
+      <Track title="Blue in Green" grandparentTitle="Miles Davis" parentTitle="Kind of Blue" ratingKey="song1">
+        <Media duration="320000"><Part key="/library/parts/blue/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+    calls = []
+
+    class FakeClient:
+        logger = None
+
+        def get_xml(self, path, params=None):
+            calls.append((path, params or {}))
+            if path == "/search":
+                return empty_xml
+            if path == "/library/sections":
+                return sections_xml
+            if path == "/library/sections/6/all" and (params or {}).get("title") == "Miles Davis":
+                return empty_xml
+            if path == "/library/sections/6/all" and "title" not in (params or {}):
+                return all_tracks_xml
+            return empty_xml
+
+        def parse_tracks(self, xml_text):
+            return mod._plex_parse_tracks(self, xml_text)
+
+    items = mod._plex_search_audio(FakeClient(), "play music Miles Davis")
+
+    assert [(item.title, item.creator) for item in items] == [("Blue in Green", "Miles Davis")]
+    assert ("/library/sections/6/all", {"type": mod.AUDIO_SEARCH_TYPE}) in calls
+
+
 def test_sanitize_search_query_removes_provider_words():
     mod = load_ability_module()
 

@@ -102,10 +102,13 @@ def score_item(item, user_text, requested_type=None):
         score += 100
     if query and query in item_text:
         score += 50
-    for token in query.split():
-        if token and token in item_text:
+    query_tokens = query.split()
+    item_tokens = item_text.split()
+    for token in query_tokens:
+        if token and token in item_tokens:
             score += 10
-    if item.title and normalize_text(item.title) in query:
+    title_text = normalize_text(item.title)
+    if title_text and title_text in query:
         score += 15
     return score
 
@@ -212,6 +215,7 @@ def _plex_parse_tracks(client, xml_text):
 
 def _plex_search_audio(client, user_text):
     query = sanitize_search_query(user_text)
+    requested_type = detect_requested_media_type(user_text)
     candidates = []
 
     try:
@@ -228,7 +232,13 @@ def _plex_search_audio(client, user_text):
             section_key = directory.attrib.get("key", "")
             if section_type in {"artist", "music"} and section_key:
                 path = f"/library/sections/{section_key}/all"
-                candidates.extend(client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "title": query})))
+                title_matches = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "title": query}))
+                candidates.extend(title_matches)
+                if not title_matches:
+                    scanned = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE}))
+                    candidates.extend(
+                        item for item in scanned if score_item(item, user_text, None) > 0
+                    )
     except Exception as exc:
         if client.logger:
             client.logger.warning(f"[PlexAudio] Section search failed: {exc}")
