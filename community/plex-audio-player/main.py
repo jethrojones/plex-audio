@@ -49,8 +49,13 @@ def sanitize_search_query(user_text):
     text = str(user_text or "").strip()
     replacements = [
         r"\bplay\b",
+        r"\bsome\b",
+        r"\bfrom\s+my\s*plex\s+library\b",
+        r"\bfor\s+my\s*plex\s+library\b",
+        r"\bmy\s*plex\s+library\b",
         r"\bfrom plex\b",
         r"\bplex\b",
+        r"\blibrary\b",
         r"\bthe audiobook\b",
         r"\ban audiobook\b",
         r"\baudiobook\b",
