@@ -44,8 +44,40 @@ PLAYER_PRIORITY = ["mpv", "ffplay", "cvlc", "mpg123"]
 # Search helpers (duplicated from main.py — split runtimes cannot share code)
 # ---------------------------------------------------------------------------
 
+_SANITIZE_PATTERNS = [
+    r"\bplay\b",
+    r"\bsome\b",
+    r"\bfrom\s+my\s*plex\s+library\b",
+    r"\bfor\s+my\s*plex\s+library\b",
+    r"\bmy\s*plex\s+library\b",
+    r"\bfrom plex\b",
+    r"\bon plex\b",
+    r"\bin plex\b",
+    r"\bplex\b",
+    r"\blibrary\b",
+    r"\bthe audiobook\b",
+    r"\ban audiobook\b",
+    r"\baudiobook\b",
+    r"\baudio book\b",
+    r"\bmusic\b",
+    r"\bsong\b",
+    r"\btrack\b",
+    r"\balbum\b",
+    r"\bartist\b",
+    r"\bplease\b",
+]
+
+
 def normalize_text(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _meaningful_query(user_text):
+    """Strip noise words; returns '' when only generic words remain (e.g. 'play music')."""
+    text = str(user_text or "").strip()
+    for pattern in _SANITIZE_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" .,-")
 
 
 def detect_requested_media_type(user_text):
@@ -61,29 +93,7 @@ def detect_requested_media_type(user_text):
 
 def sanitize_search_query(user_text):
     text = str(user_text or "").strip()
-    replacements = [
-        r"\bplay\b",
-        r"\bsome\b",
-        r"\bfrom\s+my\s*plex\s+library\b",
-        r"\bfor\s+my\s*plex\s+library\b",
-        r"\bmy\s*plex\s+library\b",
-        r"\bfrom plex\b",
-        r"\bon plex\b",
-        r"\bin plex\b",
-        r"\bplex\b",
-        r"\blibrary\b",
-        r"\bthe audiobook\b",
-        r"\ban audiobook\b",
-        r"\baudiobook\b",
-        r"\baudio book\b",
-        r"\bmusic\b",
-        r"\bsong\b",
-        r"\btrack\b",
-        r"\balbum\b",
-        r"\bartist\b",
-        r"\bplease\b",
-    ]
-    for pattern in replacements:
+    for pattern in _SANITIZE_PATTERNS:
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip(" .,-")
     return text or str(user_text or "").strip()
@@ -183,22 +193,31 @@ def _parse_tracks(xml_text):
 
 def search_plex_audio(base_url, token, user_text, get_text=_http_get_text):
     query = sanitize_search_query(user_text)
+    # When noise words are all that remain (e.g. "play music"), treat as browse-all.
+    meaningful = _meaningful_query(user_text)
     requested_type = detect_requested_media_type(user_text)
     candidates = []
 
-    try:
-        candidates.extend(_parse_tracks(get_text(plex_url(base_url, "/search", token, {"query": query}))))
-    except Exception as exc:
-        log.warning("[PlexAudio] Global search failed: %s", exc)
+    if meaningful:
+        try:
+            candidates.extend(_parse_tracks(get_text(plex_url(base_url, "/search", token, {"query": query}))))
+        except Exception as exc:
+            log.warning("[PlexAudio] Global search failed: %s", exc)
 
     try:
         sections_xml = get_text(plex_url(base_url, "/library/sections", token))
         root = ET.fromstring(sections_xml)
-        for directory in root.findall(".//Directory"):
-            section_type = directory.attrib.get("type", "")
-            section_key = directory.attrib.get("key", "")
-            if section_type in {"artist", "music"} and section_key:
-                path = "/library/sections/%s/all" % section_key
+        audio_sections = [
+            (d.attrib.get("key", ""), d.attrib.get("title", ""), d.attrib.get("type", ""))
+            for d in root.findall(".//Directory")
+            if d.attrib.get("type", "") in {"artist", "music"}
+        ]
+        log.info("[PlexAudio] Audio sections found: %s", audio_sections)
+        for section_key, section_title, section_type in audio_sections:
+            if not section_key:
+                continue
+            path = "/library/sections/%s/all" % section_key
+            if meaningful:
                 title_matches = _parse_tracks(
                     get_text(plex_url(base_url, path, token, {"type": AUDIO_SEARCH_TYPE, "title": query}))
                 )
@@ -206,6 +225,11 @@ def search_plex_audio(base_url, token, user_text, get_text=_http_get_text):
                 if not title_matches:
                     scanned = _parse_tracks(get_text(plex_url(base_url, path, token, {"type": AUDIO_SEARCH_TYPE})))
                     candidates.extend(item for item in scanned if score_item(item, user_text, None) > 0)
+            else:
+                # Generic request ("play music", "play audiobook") — return all tracks from audio sections.
+                scanned = _parse_tracks(get_text(plex_url(base_url, path, token, {"type": AUDIO_SEARCH_TYPE})))
+                log.info("[PlexAudio] Browse-all for section %r: %d tracks", section_title, len(scanned))
+                candidates.extend(scanned)
     except Exception as exc:
         log.warning("[PlexAudio] Section search failed: %s", exc)
 

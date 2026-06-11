@@ -53,6 +53,29 @@ PlexAudioClientState = collections.namedtuple(
 
 URL_SAFE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 
+_SANITIZE_PATTERNS = [
+    r"\bplay\b",
+    r"\bsome\b",
+    r"\bfrom\s+my\s*plex\s+library\b",
+    r"\bfor\s+my\s*plex\s+library\b",
+    r"\bmy\s*plex\s+library\b",
+    r"\bfrom plex\b",
+    r"\bon plex\b",
+    r"\bin plex\b",
+    r"\bplex\b",
+    r"\blibrary\b",
+    r"\bthe audiobook\b",
+    r"\ban audiobook\b",
+    r"\baudiobook\b",
+    r"\baudio book\b",
+    r"\bmusic\b",
+    r"\bsong\b",
+    r"\btrack\b",
+    r"\balbum\b",
+    r"\bartist\b",
+    r"\bplease\b",
+]
+
 
 def normalize_text(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
@@ -71,32 +94,18 @@ def detect_requested_media_type(user_text):
 
 def sanitize_search_query(user_text):
     text = str(user_text or "").strip()
-    replacements = [
-        r"\bplay\b",
-        r"\bsome\b",
-        r"\bfrom\s+my\s*plex\s+library\b",
-        r"\bfor\s+my\s*plex\s+library\b",
-        r"\bmy\s*plex\s+library\b",
-        r"\bfrom plex\b",
-        r"\bon plex\b",
-        r"\bin plex\b",
-        r"\bplex\b",
-        r"\blibrary\b",
-        r"\bthe audiobook\b",
-        r"\ban audiobook\b",
-        r"\baudiobook\b",
-        r"\baudio book\b",
-        r"\bmusic\b",
-        r"\bsong\b",
-        r"\btrack\b",
-        r"\balbum\b",
-        r"\bartist\b",
-        r"\bplease\b",
-    ]
-    for pattern in replacements:
+    for pattern in _SANITIZE_PATTERNS:
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip(" .,-")
     return text or str(user_text or "").strip()
+
+
+def _meaningful_query(user_text):
+    """Strip noise words; returns '' when only generic words remain (e.g. 'play music')."""
+    text = str(user_text or "").strip()
+    for pattern in _SANITIZE_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" .,-")
 
 
 def infer_media_type(library_title, title, creator, collection, duration_ms):
@@ -349,14 +358,16 @@ def _plex_parse_tracks(client, xml_text):
 
 def _plex_search_audio(client, user_text):
     query = sanitize_search_query(user_text)
+    meaningful = _meaningful_query(user_text)
     requested_type = detect_requested_media_type(user_text)
     candidates = []
 
-    try:
-        candidates.extend(client.parse_tracks(client.get_xml("/search", {"query": query})))
-    except Exception as exc:
-        if client.logger:
-            client.logger.warning(f"[PlexAudio] Global search failed: {exc}")
+    if meaningful:
+        try:
+            candidates.extend(client.parse_tracks(client.get_xml("/search", {"query": query})))
+        except Exception as exc:
+            if client.logger:
+                client.logger.warning(f"[PlexAudio] Global search failed: {exc}")
 
     try:
         sections_xml = client.get_xml("/library/sections")
@@ -366,13 +377,17 @@ def _plex_search_audio(client, user_text):
             section_key = directory.attrib.get("key", "")
             if section_type in {"artist", "music"} and section_key:
                 path = f"/library/sections/{section_key}/all"
-                title_matches = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "title": query}))
-                candidates.extend(title_matches)
-                if not title_matches:
+                if meaningful:
+                    title_matches = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "title": query}))
+                    candidates.extend(title_matches)
+                    if not title_matches:
+                        scanned = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE}))
+                        candidates.extend(
+                            item for item in scanned if score_item(item, user_text, None) > 0
+                        )
+                else:
                     scanned = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE}))
-                    candidates.extend(
-                        item for item in scanned if score_item(item, user_text, None) > 0
-                    )
+                    candidates.extend(scanned)
     except Exception as exc:
         if client.logger:
             client.logger.warning(f"[PlexAudio] Section search failed: {exc}")

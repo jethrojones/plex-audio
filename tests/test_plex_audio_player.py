@@ -480,3 +480,78 @@ def test_devkit_current_position_ms_accumulates_from_offset():
     assert dev.current_position_ms(state, now=1010.0) == 15000
     assert dev.current_position_ms(state, now=2000.0) == 60000
     assert dev.current_position_ms(None) == 0
+
+
+def test_meaningful_query_strips_generic_request_to_empty():
+    mod = load_ability_module()
+
+    assert mod._meaningful_query("play music") == ""
+    assert mod._meaningful_query("play music from Plex") == ""
+    assert mod._meaningful_query("play audiobook from my plex library") == ""
+    assert mod._meaningful_query("play some music please") == ""
+    assert mod._meaningful_query("play Dune audiobook") == "Dune"
+    assert mod._meaningful_query("Kind of Blue") == "Kind of Blue"
+
+
+def test_search_audio_browse_all_for_generic_request():
+    """Generic 'play music' request should return all section tracks, not an empty list."""
+    mod = load_ability_module()
+    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
+    all_tracks_xml = """
+    <MediaContainer>
+      <Track title="So What" grandparentTitle="Miles Davis" parentTitle="Kind of Blue" ratingKey="s1">
+        <Media duration="545000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="Blue in Green" grandparentTitle="Miles Davis" parentTitle="Kind of Blue" ratingKey="s2">
+        <Media duration="320000"><Part key="/library/parts/2/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    class FakeClient:
+        logger = None
+
+        def get_xml(self, path, params=None):
+            if path == "/library/sections":
+                return sections_xml
+            return all_tracks_xml
+
+        def parse_tracks(self, xml_text):
+            return mod._plex_parse_tracks(self, xml_text)
+
+    items = mod._plex_search_audio(FakeClient(), "play music")
+
+    assert len(items) == 2
+
+
+def test_devkit_meaningful_query_strips_generic_request_to_empty():
+    dev = load_devkit_module()
+
+    assert dev._meaningful_query("play music") == ""
+    assert dev._meaningful_query("play audiobook from plex") == ""
+    assert dev._meaningful_query("play Dune audiobook") == "Dune"
+
+
+def test_devkit_search_browse_all_for_generic_request():
+    """Generic 'play music' request should return all section tracks without score filtering."""
+    dev = load_devkit_module()
+    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
+    all_tracks_xml = """
+    <MediaContainer>
+      <Track title="So What" grandparentTitle="Miles Davis" parentTitle="Kind of Blue" ratingKey="s1">
+        <Media duration="545000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="Unrelated" grandparentTitle="Other Artist" parentTitle="Other Album" ratingKey="s2">
+        <Media duration="200000"><Part key="/library/parts/2/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    def fake_get(url, timeout=None):
+        if "/library/sections/6/all" in url:
+            return all_tracks_xml
+        return sections_xml
+
+    items = dev.search_plex_audio("http://10.0.0.136:32400", "tok", "play music", get_text=fake_get)
+
+    assert len(items) == 2
