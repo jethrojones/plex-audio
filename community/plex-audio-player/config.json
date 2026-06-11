@@ -1,0 +1,14 @@
+{
+  "unique_name": "plex-audio-player",
+  "description": "Search and play music and audiobooks from a Plex server.",
+  "category": "skill",
+  "matching_hotwords": [
+    "play from Plex",
+    "Plex music",
+    "play my audiobook",
+    "Plex audiobook",
+    "continue my audiobook",
+    "resume my book",
+    "play music from my server"
+  ]
+}

@@ -15,6 +15,7 @@ the two files run in different runtimes and cannot import each other.
 
 import json
 import os
+import pathlib
 import re
 import shutil
 import signal
@@ -279,16 +280,14 @@ def build_player_command(player, url, offset_seconds=0):
 
 def _read_state():
     try:
-        with open(STATE_FILE) as handle:
-            return json.load(handle)
+        return json.loads(pathlib.Path(STATE_FILE).read_text())
     except Exception:
         return None
 
 
 def _write_state(state):
     try:
-        with open(STATE_FILE, "w") as handle:
-            json.dump(state, handle)
+        pathlib.Path(STATE_FILE).write_text(json.dumps(state))
     except Exception as exc:
         log.warning("[PlexAudio] Could not write state file: %s", exc)
 
@@ -329,7 +328,7 @@ def current_position_ms(state, now=None):
 
 
 def _print_payload(success, data=None, error=None):
-    print(json.dumps({"success": bool(success), "data": data or {}, "error": error}))
+    sys.stdout.write(json.dumps({"success": bool(success), "data": data or {}, "error": error}) + "\n")
 
 
 # ---------------------------------------------------------------------------
