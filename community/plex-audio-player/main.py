@@ -654,15 +654,18 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
     async def _devkit_diagnose(self, base_url, token):
         """Returns the DevKit's diagnose report, or None when no DevKit responded."""
-        data, error = await self._devkit_call(
-            "plex_diagnose", [base_url, token or ""], DEVKIT_DIAGNOSE_TIMEOUT
-        )
         logger = self.worker.editor_logging_handler
-        if data is None:
-            logger.warning(f"[PlexAudio] DevKit unavailable, using cloud streaming path: {error}")
-            return None
-        logger.info(f"[PlexAudio] DevKit diagnose: {data}")
-        return data
+        for attempt in range(2):
+            data, error = await self._devkit_call(
+                "plex_diagnose", [base_url, token or ""], DEVKIT_DIAGNOSE_TIMEOUT
+            )
+            if data is not None:
+                logger.info(f"[PlexAudio] DevKit diagnose (attempt {attempt + 1}): {data}")
+                return data
+            logger.warning(f"[PlexAudio] DevKit diagnose attempt {attempt + 1} failed: {error}")
+            if attempt == 0:
+                await asyncio.sleep(3)
+        return None
 
     async def _devkit_search(self, client, user_request):
         data, error = await self._devkit_call(
@@ -687,7 +690,9 @@ class PlexAudioPlayerCapability(MatchingCapability):
             return None
 
     async def _devkit_playback(self, client, item, offset_ms):
-        """Play on the DevKit and wait for finish or a stop command. Returns final position in ms."""
+        """Play on the DevKit and wait for finish or a stop command.
+        Returns (final_position_ms, user_stopped) where user_stopped=True means the user
+        asked to stop (no more tracks), False means the track ended naturally."""
         data, error = await self._devkit_call(
             "plex_play",
             [
@@ -718,16 +723,16 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 status_failures = 0
                 position_ms = int(status.get("position_ms") or position_ms)
                 if not status.get("playing"):
-                    return position_ms
+                    return position_ms, False
             heard = await self._listen_during_playback()
             if heard and playback_stop_requested(heard):
                 stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
                 if stop_data is not None:
                     position_ms = int(stop_data.get("position_ms") or position_ms)
                 await self.capability_worker.speak("Okay, stopping Plex.")
-                return position_ms
+                return position_ms, True
         await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
-        return position_ms
+        return position_ms, False
 
     async def _get_initial_request(self):
         try:
@@ -807,17 +812,23 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # so the cloud runtime never needs a route to the Plex server.
             devkit_info = await self._devkit_diagnose(client.base_url, client.token)
             if devkit_info is None:
+                if _url_is_local(client.base_url):
+                    await self.capability_worker.speak(
+                        "I could not connect to the OpenHome device to reach your Plex server. "
+                        "Make sure the device is powered on and the Plex Audio ability is synced to it, then try again."
+                    )
+                    return
                 devkit_mode = False
             elif not devkit_info.get("plex_reachable"):
                 await self.capability_worker.speak(
-                    "Your DevKit is online, but it cannot reach the Plex server at the configured address. "
+                    "Your OpenHome device is online, but it cannot reach the Plex server at the configured address. "
                     "Check that Plex is running and that plex base url is the server's local network address, like its LAN IP and port 32400."
                 )
                 return
             elif not devkit_info.get("player"):
                 await self.capability_worker.speak(
-                    "Your DevKit can reach Plex, but it has no audio player installed. "
-                    "On the DevKit, run sudo apt install mpv, then ask me again."
+                    "Your OpenHome device can reach Plex, but it has no audio player installed. "
+                    "On the device, run sudo apt install mpv, then ask me again."
                 )
                 return
             else:
@@ -828,7 +839,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")
                 return
 
-            resume_state = None
+            # --- Resume audiobook ---
             if resume_requested(user_request):
                 resume_state = self._read_resume_state()
                 choice = item_from_resume_state(resume_state)
@@ -839,31 +850,62 @@ class PlexAudioPlayerCapability(MatchingCapability):
                     return
                 offset_ms = int(resume_state.get("offset_ms") or 0)
                 await self.capability_worker.speak(f"Resuming {describe_item(choice)} from Plex.")
-            else:
-                await self.capability_worker.speak("Searching your Plex audio libraries.")
-                if devkit_mode:
-                    items = await self._devkit_search(client, user_request)
-                else:
-                    items = client.search_audio(user_request)
-                choice = choose_best_item(items, user_request)
-                if not choice:
-                    await self.capability_worker.speak(
-                        "I could not find matching music or audiobooks in Plex. Try a title, artist, album, or book name."
-                    )
-                    return
-                offset_ms = 0
-                await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
-
-            if choice.media_type == "audiobook":
                 self._write_resume_state(build_resume_state(choice, offset_ms))
-            if devkit_mode:
-                final_position_ms = await self._devkit_playback(client, choice, offset_ms)
-                elapsed_ms = max(0, final_position_ms - int(offset_ms or 0))
-            else:
-                elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
-            if choice.media_type == "audiobook":
+                if devkit_mode:
+                    final_position_ms, _ = await self._devkit_playback(client, choice, offset_ms)
+                    elapsed_ms = max(0, final_position_ms - offset_ms)
+                else:
+                    elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
                 current_state = self._read_resume_state() or build_resume_state(choice, offset_ms)
                 self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
+                return
+
+            # --- New search ---
+            await self.capability_worker.speak("Searching your Plex audio libraries.")
+            if devkit_mode:
+                items = await self._devkit_search(client, user_request)
+            else:
+                items = client.search_audio(user_request)
+
+            choice = choose_best_item(items, user_request)
+            if not choice:
+                await self.capability_worker.speak(
+                    "I could not find matching music or audiobooks in Plex. Try a title, artist, album, or book name."
+                )
+                return
+
+            # --- Audiobook: single track with resume state ---
+            if choice.media_type == "audiobook":
+                await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
+                self._write_resume_state(build_resume_state(choice, 0))
+                if devkit_mode:
+                    final_position_ms, _ = await self._devkit_playback(client, choice, 0)
+                    elapsed_ms = max(0, final_position_ms)
+                else:
+                    elapsed_ms = await self._stream_audio(client.stream_url_for(choice))
+                current_state = self._read_resume_state() or build_resume_state(choice, 0)
+                self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
+                return
+
+            # --- Music: build a queue from all matching results, play in order ---
+            # items is already sorted by relevance score (best first from _devkit_search /
+            # search_plex_audio). Start from the best match; wrap to include lower-ranked tracks.
+            try:
+                start_idx = next(i for i, it in enumerate(items) if it.part_key == choice.part_key)
+            except StopIteration:
+                start_idx = 0
+            queue = items[start_idx:] + items[:start_idx]
+
+            await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
+            for track in queue:
+                if devkit_mode:
+                    _, user_stopped = await self._devkit_playback(client, track, 0)
+                    if user_stopped:
+                        return
+                else:
+                    await self._stream_audio(client.stream_url_for(track))
+                    return  # cloud path cannot detect track end, play one track only
+
         except Exception as exc:
             self.worker.editor_logging_handler.error(f"[PlexAudio] Error: {exc}")
             await self.capability_worker.speak(plex_error_message(base_url, exc, devkit_mode))
