@@ -1,12 +1,20 @@
 {
   "unique_name": "plex-audio-player",
-  "description": "Search and play music and audiobooks from a Plex server.",
-  "category": "skill",
-  "matching_hotwords": [
+  "name": "PlexAudio",
+  "description": "Play music and audiobooks from your Plex library using voice commands",
+  "category": "local",
+  "trigger_words": [
     "play from Plex",
     "Plex music",
+    "play music from Plex",
+    "play on Plex",
+    "play from my Plex",
+    "Plex library",
+    "play music",
     "play my audiobook",
     "Plex audiobook",
+    "audiobook",
+    "play audiobook",
     "continue my audiobook",
     "resume my book",
     "play music from my server"

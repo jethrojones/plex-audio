@@ -37,7 +37,7 @@ except Exception:  # standalone/local test runs without devkit_utils
 REQUEST_TIMEOUT = 15
 AUDIO_SEARCH_TYPE = "10"
 MAX_SEARCH_RESULTS = 12
-STATE_FILE = "/tmp/plex_audio_player_state.json"
+STATE_FILE = "/home/openhome/.plex_audio_state.json"
 PLAYER_PRIORITY = ["mpv", "ffplay", "cvlc", "mpg123"]
 
 
@@ -256,10 +256,19 @@ def detect_player(which=shutil.which):
     return None
 
 
+PULSE_USER_ID = "1000"
+PULSE_ENV_EXTRAS = {
+    "PULSE_RUNTIME_PATH": "/run/user/%s/pulse" % PULSE_USER_ID,
+    "PULSE_SERVER": "unix:/run/user/%s/pulse/native" % PULSE_USER_ID,
+    "XDG_RUNTIME_DIR": "/run/user/%s" % PULSE_USER_ID,
+}
+
+
 def build_player_command(player, url, offset_seconds=0):
     offset_seconds = max(0, int(offset_seconds or 0))
     if player == "mpv":
-        return ["mpv", "--no-video", "--no-terminal", "--really-quiet", "--start=%d" % offset_seconds, url]
+        return ["mpv", "--no-video", "--no-terminal", "--really-quiet", "--ao=pulse",
+                "--start=%d" % offset_seconds, url]
     if player == "ffplay":
         command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
         if offset_seconds:
@@ -388,12 +397,15 @@ def plex_play(base_url="", token="", part_key="", offset_ms="0", duration_ms="0"
             offset = 0
         url = plex_url(base_url, part_key, token, {"download": "1"})
         command = build_player_command(player, url, offset // 1000)
+        env = os.environ.copy()
+        env.update(PULSE_ENV_EXTRAS)
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
         try:
             duration = max(0, int(float(duration_ms or 0)))
