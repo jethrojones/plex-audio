@@ -313,11 +313,19 @@ def _print_payload(success, data=None, error=None):
 # ---------------------------------------------------------------------------
 
 def plex_diagnose(base_url="", token=""):
-    """Report Plex reachability from the DevKit and available player binaries."""
-    data = {"player": detect_player(), "players_checked": PLAYER_PRIORITY, "plex_reachable": False}
-    error = None
+    """Report Plex reachability from the DevKit and available player binaries.
+
+    Always succeeds: a diagnosis is a report, not an error. main.py branches on
+    the data fields so it can speak the precise problem to the user.
+    """
+    data = {
+        "player": detect_player(),
+        "players_checked": PLAYER_PRIORITY,
+        "plex_reachable": False,
+        "detail": "",
+    }
     if not str(base_url or "").strip():
-        error = {"code": "no_base_url", "message": "No Plex base URL provided."}
+        data["detail"] = "No Plex base URL provided."
     else:
         try:
             identity_xml = _http_get_text(plex_url(base_url, "/identity", token), timeout=8)
@@ -327,13 +335,8 @@ def plex_diagnose(base_url="", token=""):
             data["version"] = root.attrib.get("version", "")
         except Exception as exc:
             log.warning("[PlexAudio] Plex unreachable from DevKit: %s", exc)
-            error = {"code": "plex_unreachable", "message": str(exc)}
-    if not data["player"] and not error:
-        error = {
-            "code": "no_player",
-            "message": "No audio player found on the DevKit. Install one with: sudo apt install mpv",
-        }
-    _print_payload(error is None, data, error)
+            data["detail"] = str(exc)
+    _print_payload(True, data)
 
 
 def plex_search(base_url="", token="", user_text=""):

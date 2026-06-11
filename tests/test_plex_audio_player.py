@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -453,6 +454,23 @@ def test_devkit_search_scores_sorts_and_caps_results():
 
     assert [item["title"] for item in items] == ["Enter Sandman"]
     assert items[0]["media_type"] == "music"
+
+
+def test_devkit_diagnose_always_reports_instead_of_erroring(capsys):
+    dev = load_devkit_module()
+    original_get = dev._http_get_text
+    dev._http_get_text = lambda url, timeout=None: (_ for _ in ()).throw(OSError("Connection refused"))
+    try:
+        dev.plex_diagnose("http://10.0.0.136:32400", "tok")
+    finally:
+        dev._http_get_text = original_get
+
+    payload = json.loads(capsys.readouterr().out.strip())
+
+    assert payload["success"] is True
+    assert payload["data"]["plex_reachable"] is False
+    assert "Connection refused" in payload["data"]["detail"]
+    assert "player" in payload["data"]
 
 
 def test_devkit_current_position_ms_accumulates_from_offset():

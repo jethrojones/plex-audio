@@ -638,6 +638,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
         return payload.get("data") or {}, None
 
     async def _devkit_diagnose(self, base_url, token):
+        """Returns the DevKit's diagnose report, or None when no DevKit responded."""
         data, error = await self._devkit_call(
             "plex_diagnose", [base_url, token or ""], DEVKIT_DIAGNOSE_TIMEOUT
         )
@@ -645,8 +646,6 @@ class PlexAudioPlayerCapability(MatchingCapability):
         if data is None:
             logger.warning(f"[PlexAudio] DevKit unavailable, using cloud streaming path: {error}")
             return None
-        if not data.get("player"):
-            logger.warning("[PlexAudio] DevKit reachable but no audio player installed (need mpv/ffplay/cvlc).")
         logger.info(f"[PlexAudio] DevKit diagnose: {data}")
         return data
 
@@ -791,7 +790,22 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # Preferred path: the DevKit reaches Plex over the LAN and plays locally,
             # so the cloud runtime never needs a route to the Plex server.
             devkit_info = await self._devkit_diagnose(client.base_url, client.token)
-            devkit_mode = bool(devkit_info and devkit_info.get("plex_reachable") and devkit_info.get("player"))
+            if devkit_info is None:
+                devkit_mode = False
+            elif not devkit_info.get("plex_reachable"):
+                await self.capability_worker.speak(
+                    "Your DevKit is online, but it cannot reach the Plex server at the configured address. "
+                    "Check that Plex is running and that plex base url is the server's local network address, like its LAN IP and port 32400."
+                )
+                return
+            elif not devkit_info.get("player"):
+                await self.capability_worker.speak(
+                    "Your DevKit can reach Plex, but it has no audio player installed. "
+                    "On the DevKit, run sudo apt install mpv, then ask me again."
+                )
+                return
+            else:
+                devkit_mode = True
 
             user_request = await self._get_initial_request()
             if not user_request or exit_requested(user_request):
