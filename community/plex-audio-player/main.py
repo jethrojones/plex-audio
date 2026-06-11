@@ -1,4 +1,6 @@
+import asyncio
 import collections
+import json
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -19,6 +21,25 @@ AUDIO_SEARCH_TYPE = "10"
 RESUME_STATE_KEY = "plex_audio_last_audiobook"
 RESUME_END_THRESHOLD_MS = 60 * 1000
 EXIT_WORDS = {"stop", "exit", "quit", "cancel", "nevermind", "never mind", "done", "bye"}
+DEVKIT_DIAGNOSE_TIMEOUT = 25
+DEVKIT_SEARCH_TIMEOUT = 45
+DEVKIT_PLAY_TIMEOUT = 20
+DEVKIT_CONTROL_TIMEOUT = 15
+PLAYBACK_LISTEN_WINDOW_SECONDS = 15
+MAX_PLAYBACK_SECONDS = 12 * 60 * 60
+STOP_WORDS = {"stop", "pause", "quit", "exit", "cancel", "enough", "done"}
+STOP_PHRASES = [
+    "stop the music",
+    "stop playing",
+    "stop playback",
+    "stop the audiobook",
+    "stop plex",
+    "pause the music",
+    "pause plex",
+    "turn it off",
+    "shut it off",
+    "that s enough",
+]
 
 PlexAudioItem = collections.namedtuple(
     "PlexAudioItem",
@@ -406,6 +427,63 @@ def exit_requested(user_text):
     return text in EXIT_WORDS or any(text == normalize_text(word) for word in EXIT_WORDS)
 
 
+def playback_stop_requested(user_text):
+    text = normalize_text(user_text)
+    if not text:
+        return False
+    tokens = text.split()
+    # Music playing near the mic produces noisy transcriptions ("don't stop believing"),
+    # so single stop words only count in short utterances.
+    if len(tokens) <= 4 and any(token in STOP_WORDS for token in tokens):
+        return True
+    return any(phrase in text for phrase in STOP_PHRASES)
+
+
+def parse_devkit_payload(output_text):
+    text = str(output_text or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else None
+    except ValueError:
+        pass
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    return payload
+            except ValueError:
+                continue
+    return None
+
+
+def items_from_search_payload(payload):
+    items = []
+    for entry in (payload or {}).get("items") or []:
+        part_key = str(entry.get("part_key") or "")
+        if not part_key:
+            continue
+        try:
+            duration_ms = int(entry.get("duration_ms") or 0)
+        except (TypeError, ValueError):
+            duration_ms = 0
+        items.append(
+            PlexAudioItem(
+                str(entry.get("title") or "Untitled track"),
+                str(entry.get("creator") or "Unknown artist"),
+                str(entry.get("collection") or ""),
+                str(entry.get("media_type") or "music"),
+                part_key,
+                duration_ms,
+                str(entry.get("rating_key") or ""),
+            )
+        )
+    return items
+
+
 def describe_item(item):
     if item.media_type == "audiobook":
         if item.collection and item.collection != item.creator:
@@ -457,12 +535,24 @@ def updated_resume_state(state, elapsed_ms):
     return updated
 
 
-def plex_error_message(base_url, exc):
+def plex_error_message(base_url, exc, devkit_mode=False):
     error_text = str(exc or "").lower()
     base_text = str(base_url or "")
     if "401" in error_text or "unauthorized" in error_text:
         return "Plex rejected the token. Check the plex token API key and try again."
+    if "no_player" in error_text or "no audio player" in error_text:
+        return (
+            "Your DevKit has no audio player installed. "
+            "Install one on the DevKit with sudo apt install mpv, then try again."
+        )
+    if "devkit" in error_text:
+        return (
+            "I could not reach your DevKit to play from Plex. "
+            "Check that the DevKit is online and this Ability is synced to it as a Local Ability."
+        )
     if "timed out" in error_text or "connecttimeout" in error_text or "connection refused" in error_text:
+        if devkit_mode:
+            return "Your DevKit cannot reach the Plex server. Check that Plex is running and the plex base url points to its LAN address."
         if "192.168." in base_text or "10." in base_text or "172." in base_text or "localhost" in base_text:
             return (
                 "OpenHome cannot reach your Plex server at that local network address. "
@@ -525,6 +615,105 @@ class PlexAudioPlayerCapability(MatchingCapability):
             return PlexAudioClient(connection.get("base_url"), connection.get("token") or token, logger)
         return None
 
+    async def _devkit_call(self, function_name, args, timeout):
+        """Run a devkit_functions.py function and return (payload, error_text)."""
+        if not hasattr(self.capability_worker, "send_devkit_capability_action"):
+            return None, "DevKit actions are not available in this runtime."
+        try:
+            result = await self.capability_worker.send_devkit_capability_action(
+                function_name=function_name,
+                args=[str(arg) for arg in args],
+                timeout=timeout,
+            )
+        except Exception as exc:
+            return None, f"DevKit call {function_name} failed: {exc}"
+        if not isinstance(result, dict):
+            return None, f"DevKit call {function_name} returned an unexpected result."
+        payload = parse_devkit_payload(result.get("output"))
+        if payload is None:
+            return None, f"DevKit call {function_name} returned no payload: {result.get('error')}"
+        if not payload.get("success"):
+            error = payload.get("error") or {}
+            return None, f"{error.get('code', 'devkit_error')}: {error.get('message', 'unknown DevKit error')}"
+        return payload.get("data") or {}, None
+
+    async def _devkit_diagnose(self, base_url, token):
+        data, error = await self._devkit_call(
+            "plex_diagnose", [base_url, token or ""], DEVKIT_DIAGNOSE_TIMEOUT
+        )
+        logger = self.worker.editor_logging_handler
+        if data is None:
+            logger.warning(f"[PlexAudio] DevKit unavailable, using cloud streaming path: {error}")
+            return None
+        if not data.get("player"):
+            logger.warning("[PlexAudio] DevKit reachable but no audio player installed (need mpv/ffplay/cvlc).")
+        logger.info(f"[PlexAudio] DevKit diagnose: {data}")
+        return data
+
+    async def _devkit_search(self, client, user_request):
+        data, error = await self._devkit_call(
+            "plex_search", [client.base_url, client.token or "", user_request], DEVKIT_SEARCH_TIMEOUT
+        )
+        if data is None:
+            raise RuntimeError(f"DevKit search failed: {error}")
+        return items_from_search_payload(data)
+
+    async def _listen_during_playback(self):
+        """Wait briefly for the user to say something; None on silence."""
+        try:
+            return await asyncio.wait_for(
+                self.capability_worker.wait_for_complete_transcription(),
+                timeout=PLAYBACK_LISTEN_WINDOW_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return None
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Playback listen failed: {exc}")
+            await self.worker.session_tasks.sleep(PLAYBACK_LISTEN_WINDOW_SECONDS)
+            return None
+
+    async def _devkit_playback(self, client, item, offset_ms):
+        """Play on the DevKit and wait for finish or a stop command. Returns final position in ms."""
+        data, error = await self._devkit_call(
+            "plex_play",
+            [
+                client.base_url,
+                client.token or "",
+                item.part_key,
+                str(int(offset_ms or 0)),
+                str(int(item.duration_ms or 0)),
+                item.title,
+            ],
+            DEVKIT_PLAY_TIMEOUT,
+        )
+        if data is None:
+            raise RuntimeError(f"DevKit playback failed: {error}")
+
+        started = time.monotonic()
+        position_ms = int(offset_ms or 0)
+        status_failures = 0
+        while time.monotonic() - started < MAX_PLAYBACK_SECONDS:
+            status, status_error = await self._devkit_call("plex_status", [], DEVKIT_CONTROL_TIMEOUT)
+            if status is None:
+                status_failures += 1
+                self.worker.editor_logging_handler.warning(f"[PlexAudio] Status check failed: {status_error}")
+                if status_failures >= 3:
+                    break
+            else:
+                status_failures = 0
+                position_ms = int(status.get("position_ms") or position_ms)
+                if not status.get("playing"):
+                    return position_ms
+            heard = await self._listen_during_playback()
+            if heard and playback_stop_requested(heard):
+                stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                if stop_data is not None:
+                    position_ms = int(stop_data.get("position_ms") or position_ms)
+                await self.capability_worker.speak("Okay, stopping Plex.")
+                return position_ms
+        await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+        return position_ms
+
     async def _get_initial_request(self):
         try:
             msg = await self.capability_worker.wait_for_complete_transcription()
@@ -582,6 +771,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
     async def run(self):
         base_url = ""
+        devkit_mode = False
         try:
             base_url, token, account_token, server_name, machine_identifier, missing = self._get_required_config()
             if missing:
@@ -597,6 +787,12 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 )
                 return
             base_url = client.base_url
+
+            # Preferred path: the DevKit reaches Plex over the LAN and plays locally,
+            # so the cloud runtime never needs a route to the Plex server.
+            devkit_info = await self._devkit_diagnose(client.base_url, client.token)
+            devkit_mode = bool(devkit_info and devkit_info.get("plex_reachable") and devkit_info.get("player"))
+
             user_request = await self._get_initial_request()
             if not user_request or exit_requested(user_request):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")
@@ -615,7 +811,10 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak(f"Resuming {describe_item(choice)} from Plex.")
             else:
                 await self.capability_worker.speak("Searching your Plex audio libraries.")
-                items = client.search_audio(user_request)
+                if devkit_mode:
+                    items = await self._devkit_search(client, user_request)
+                else:
+                    items = client.search_audio(user_request)
                 choice = choose_best_item(items, user_request)
                 if not choice:
                     await self.capability_worker.speak(
@@ -627,12 +826,16 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
             if choice.media_type == "audiobook":
                 self._write_resume_state(build_resume_state(choice, offset_ms))
-            elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
+            if devkit_mode:
+                final_position_ms = await self._devkit_playback(client, choice, offset_ms)
+                elapsed_ms = max(0, final_position_ms - int(offset_ms or 0))
+            else:
+                elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
             if choice.media_type == "audiobook":
                 current_state = self._read_resume_state() or build_resume_state(choice, offset_ms)
                 self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
         except Exception as exc:
             self.worker.editor_logging_handler.error(f"[PlexAudio] Error: {exc}")
-            await self.capability_worker.speak(plex_error_message(base_url, exc))
+            await self.capability_worker.speak(plex_error_message(base_url, exc, devkit_mode))
         finally:
             self.capability_worker.resume_normal_flow()

@@ -332,3 +332,133 @@ def test_choose_best_connection_prefers_matching_preferred_subnet():
     chosen = mod.choose_best_plex_connection(connections, preferred_subnets=["10."])
 
     assert chosen["base_url"] == "http://10.0.0.136:32400"
+
+
+def load_devkit_module():
+    path = Path(__file__).resolve().parents[1] / "community" / "plex-audio-player" / "devkit_functions.py"
+    spec = importlib.util.spec_from_file_location("plex_audio_player_devkit", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_playback_stop_requested_detects_short_stop_commands():
+    mod = load_ability_module()
+
+    assert mod.playback_stop_requested("stop")
+    assert mod.playback_stop_requested("pause it please")
+    assert mod.playback_stop_requested("stop the music")
+    assert mod.playback_stop_requested("okay that's enough music for now thank you")
+    assert not mod.playback_stop_requested("don't stop believing hold on to that feeling streetlight people")
+    assert not mod.playback_stop_requested("")
+
+
+def test_parse_devkit_payload_handles_clean_and_noisy_output():
+    mod = load_ability_module()
+
+    clean = mod.parse_devkit_payload('{"success": true, "data": {"playing": false}, "error": null}')
+    assert clean["success"] is True
+
+    noisy = mod.parse_devkit_payload('startup notice\n{"success": true, "data": {}, "error": null}\n')
+    assert noisy["success"] is True
+
+    assert mod.parse_devkit_payload("") is None
+    assert mod.parse_devkit_payload("not json at all") is None
+
+
+def test_items_from_search_payload_builds_audio_items():
+    mod = load_ability_module()
+    payload = {
+        "items": [
+            {
+                "title": "So What",
+                "creator": "Miles Davis",
+                "collection": "Kind of Blue",
+                "media_type": "music",
+                "part_key": "/library/parts/1/file.mp3",
+                "duration_ms": 545000,
+                "rating_key": "song1",
+            },
+            {"title": "No part key", "part_key": ""},
+        ]
+    }
+
+    items = mod.items_from_search_payload(payload)
+
+    assert len(items) == 1
+    assert items[0].title == "So What"
+    assert items[0].media_type == "music"
+    assert items[0].duration_ms == 545000
+    assert mod.items_from_search_payload(None) == []
+
+
+def test_devkit_plex_url_adds_token_and_download_params():
+    dev = load_devkit_module()
+
+    url = dev.plex_url("http://10.0.0.136:32400/", "/library/parts/7/file.m4b", "tok", {"download": "1"})
+
+    assert url.startswith("http://10.0.0.136:32400/library/parts/7/file.m4b?")
+    assert "X-Plex-Token=tok" in url
+    assert "download=1" in url
+
+
+def test_devkit_detect_player_uses_priority_order():
+    dev = load_devkit_module()
+
+    assert dev.detect_player(which=lambda name: name in {"ffplay", "mpg123"}) == "ffplay"
+    assert dev.detect_player(which=lambda name: name == "mpv") == "mpv"
+    assert dev.detect_player(which=lambda name: None) is None
+
+
+def test_devkit_build_player_command_includes_offset_for_mpv_and_ffplay():
+    dev = load_devkit_module()
+
+    mpv = dev.build_player_command("mpv", "http://plex/stream", offset_seconds=125)
+    ffplay = dev.build_player_command("ffplay", "http://plex/stream", offset_seconds=125)
+
+    assert "--start=125" in mpv
+    assert mpv[-1] == "http://plex/stream"
+    assert "-ss" in ffplay
+    assert ffplay[ffplay.index("-ss") + 1] == "125"
+
+
+def test_devkit_search_scores_sorts_and_caps_results():
+    dev = load_devkit_module()
+    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
+    empty_xml = '<MediaContainer size="0" />'
+    all_tracks_xml = """
+    <MediaContainer>
+      <Track title="Enter Sandman" grandparentTitle="Metallica" parentTitle="Metallica" ratingKey="s1">
+        <Media duration="330000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="Unrelated" grandparentTitle="Someone Else" parentTitle="Other" ratingKey="s2">
+        <Media duration="200000"><Part key="/library/parts/2/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    def fake_get(url, timeout=None):
+        if "/search" in url:
+            return empty_xml
+        if "/library/sections/6/all" in url and "title=" in url:
+            return empty_xml
+        if "/library/sections/6/all" in url:
+            return all_tracks_xml
+        return sections_xml
+
+    items = dev.search_plex_audio("http://10.0.0.136:32400", "tok", "play Metallica on plex", get_text=fake_get)
+
+    assert [item["title"] for item in items] == ["Enter Sandman"]
+    assert items[0]["media_type"] == "music"
+
+
+def test_devkit_current_position_ms_accumulates_from_offset():
+    dev = load_devkit_module()
+    state = {"offset_ms": 5000, "started_at": 1000.0, "duration_ms": 60000}
+
+    assert dev.current_position_ms(state, now=1010.0) == 15000
+    assert dev.current_position_ms(state, now=2000.0) == 60000
+    assert dev.current_position_ms(None) == 0

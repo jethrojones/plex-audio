@@ -4,12 +4,16 @@ A focused repo for one OpenHome Ability: `plex-audio-player`.
 
 The Ability lets an OpenHome Agent search and play audio-only media from a Plex server, including music and audiobooks. It supports audiobook resume state and Plex connection via either a manual server URL or Plex.tv resource discovery.
 
+It is a **Local Ability**: `main.py` runs in OpenHome's standard Ability runtime (cloud), while `devkit_functions.py` runs on the OpenHome DevKit and talks to Plex over the LAN. This means Plex does not need to be reachable from the internet — no port forwarding or Plex Remote Access required when a DevKit is on the same network as Plex.
+
 ## Project layout
 
 ```text
 community/plex-audio-player/
-  main.py       # OpenHome Ability
-  README.md    # Ability setup and usage docs
+  main.py               # Standard Ability runtime: voice flow, search choice, resume state
+  devkit_functions.py   # Runs on the DevKit: Plex LAN search + local audio playback
+  requirements.txt      # DevKit deps (stdlib only — intentionally empty)
+  README.md             # Ability setup and usage docs
   __init__.py
 
 tests/
@@ -20,15 +24,17 @@ validate_ability.py
 
 ## Setup in OpenHome
 
-Upload the packaged Ability ZIP, then configure API keys as needed:
+Upload the packaged Ability ZIP, set the Ability category to **Local**, and sync it to your DevKit from the Live Editor. Then configure API keys as needed:
 
-- `plex_base_url` — optional manual Plex server URL, e.g. a working `plex.direct` URL or `http://HOST:32400`.
-- `plex_token` — optional Plex server token.
+- `plex_base_url` — Plex server URL **as reachable from the DevKit**, e.g. `http://10.0.0.136:32400`.
+- `plex_token` — optional Plex server token. Not needed if Plex allows your local network without auth (Settings → Server → Network → allowed networks) — then the LAN IP and port in `plex_base_url` is the only key required.
 - `plex_account_token` — optional token for Plex.tv resource discovery.
 - `plex_server_name` — optional selector when the Plex account has multiple servers.
 - `plex_machine_identifier` — optional exact Plex server selector.
 
-If `plex_base_url` is present, the Ability uses it first. If not, it tries Plex.tv resource discovery with `plex_account_token`.
+If `plex_base_url` is present, the Ability uses it first. If not, it tries Plex.tv resource discovery with `plex_account_token` (preferring LAN connection URLs).
+
+If no DevKit is connected (or the DevKit cannot reach Plex), the Ability falls back to streaming through the standard runtime, which then requires a Plex URL reachable from the internet.
 
 ## Test
 
@@ -66,3 +72,5 @@ PY
 ## Notes
 
 OpenHome's live editor blocks some imports that work locally. Keep `main.py` conservative: no `socket`, `urllib`, `types`, raw `open()`, `print()`, `eval()`, or `exec()`.
+
+`devkit_functions.py` is exempt: it runs in the DevKit's normal Python environment, so it may use `urllib`, `subprocess`, `open()`, and `print()` (stdout is the return channel to `main.py`). The search-scoring helpers are duplicated between the two files on purpose — the two runtimes cannot import each other.
