@@ -726,6 +726,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                     return position_ms, False
             heard = await self._listen_during_playback()
             if heard and playback_stop_requested(heard):
+                await self._devkit_call("plex_duck", ["10"], 5)
                 stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
                 if stop_data is not None:
                     position_ms = int(stop_data.get("position_ms") or position_ms)
@@ -861,6 +862,8 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 return
 
             # --- New search ---
+            # Duck any in-progress music so the user can hear the response.
+            await self._devkit_call("plex_duck", ["20"], 5)
             await self.capability_worker.speak("Searching your Plex audio libraries.")
             if devkit_mode:
                 items = await self._devkit_search(client, user_request)

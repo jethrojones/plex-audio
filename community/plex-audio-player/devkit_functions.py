@@ -19,6 +19,7 @@ import pathlib
 import re
 import shutil
 import signal
+import socket as _socket
 import subprocess
 import sys
 import time
@@ -38,6 +39,7 @@ REQUEST_TIMEOUT = 15
 AUDIO_SEARCH_TYPE = "10"
 MAX_SEARCH_RESULTS = 12
 STATE_FILE = "/home/openhome/.plex_audio_state.json"
+MPV_IPC_SOCKET = "/tmp/mpv-plex.sock"
 PLAYER_PRIORITY = ["mpv", "ffplay", "cvlc", "mpg123"]
 
 
@@ -268,6 +270,7 @@ def build_player_command(player, url, offset_seconds=0):
     offset_seconds = max(0, int(offset_seconds or 0))
     if player == "mpv":
         return ["mpv", "--no-video", "--no-terminal", "--really-quiet", "--ao=pulse",
+                "--input-ipc-server=%s" % MPV_IPC_SOCKET,
                 "--start=%d" % offset_seconds, url]
     if player == "ffplay":
         command = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
@@ -490,12 +493,37 @@ def plex_status():
     )
 
 
+def plex_duck(volume="20"):
+    """Lower or restore mpv's volume via its IPC socket.
+
+    Call with volume="20" to duck before the bot speaks, volume="100" to
+    restore after. Uses mpv's JSON IPC protocol — no PulseAudio permission
+    issues. Silently succeeds if mpv isn't currently playing.
+    """
+    try:
+        vol = max(0, min(100, int(float(volume or 20))))
+        if not os.path.exists(MPV_IPC_SOCKET):
+            _print_payload(True, {"volume": None, "message": "no mpv socket"})
+            return
+        cmd = json.dumps({"command": ["set_property", "volume", vol]}) + "\n"
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(MPV_IPC_SOCKET)
+        s.sendall(cmd.encode())
+        s.close()
+        _print_payload(True, {"volume": vol})
+    except Exception as exc:
+        log.warning("[PlexAudio] Duck failed: %s", exc)
+        _print_payload(False, {}, {"code": "duck_failed", "message": str(exc)})
+
+
 FUNCTION_REGISTRY = {
     "plex_diagnose": plex_diagnose,
     "plex_search": plex_search,
     "plex_play": plex_play,
     "plex_stop": plex_stop,
     "plex_status": plex_status,
+    "plex_duck": plex_duck,
 }
 
 if __name__ == "__main__":
