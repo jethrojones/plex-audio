@@ -697,6 +697,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 str(int(offset_ms or 0)),
                 str(int(item.duration_ms or 0)),
                 item.title,
+                item.rating_key or "",
             ],
             DEVKIT_PLAY_TIMEOUT,
         )

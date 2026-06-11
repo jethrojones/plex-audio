@@ -380,7 +380,36 @@ def plex_search(base_url="", token="", user_text=""):
         _print_payload(False, {}, {"code": "search_failed", "message": str(exc)})
 
 
-def plex_play(base_url="", token="", part_key="", offset_ms="0", duration_ms="0", title=""):
+PLEX_CLIENT_ID = "openhome-devkit-plexaudio"
+
+
+def _report_timeline(plex_state, state):
+    """Report playback position to Plex so it shows in the dashboard."""
+    try:
+        base_url = str(state.get("base_url") or "").strip()
+        token = str(state.get("token") or "")
+        rating_key = str(state.get("rating_key") or "")
+        if not base_url or not rating_key:
+            return
+        position = current_position_ms(state)
+        duration = int(state.get("duration_ms") or 0)
+        params = {
+            "ratingKey": rating_key,
+            "key": "/library/metadata/%s" % rating_key,
+            "state": plex_state,
+            "time": str(position),
+            "duration": str(duration),
+            "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
+            "X-Plex-Product": "OpenHome PlexAudio",
+            "X-Plex-Version": "1.0",
+            "X-Plex-Platform": "Linux",
+        }
+        _http_get_text(plex_url(base_url, "/:/timeline", token, params), timeout=5)
+    except Exception as exc:
+        log.debug("[PlexAudio] Timeline report failed (non-fatal): %s", exc)
+
+
+def plex_play(base_url="", token="", part_key="", offset_ms="0", duration_ms="0", title="", rating_key=""):
     try:
         _kill_player(_read_state())
         player = detect_player()
@@ -395,7 +424,7 @@ def plex_play(base_url="", token="", part_key="", offset_ms="0", duration_ms="0"
             offset = max(0, int(float(offset_ms or 0)))
         except ValueError:
             offset = 0
-        url = plex_url(base_url, part_key, token, {"download": "1"})
+        url = plex_url(base_url, part_key, token)
         command = build_player_command(player, url, offset // 1000)
         env = os.environ.copy()
         env.update(PULSE_ENV_EXTRAS)
@@ -411,17 +440,20 @@ def plex_play(base_url="", token="", part_key="", offset_ms="0", duration_ms="0"
             duration = max(0, int(float(duration_ms or 0)))
         except ValueError:
             duration = 0
-        _write_state(
-            {
-                "pid": process.pid,
-                "player": player,
-                "part_key": part_key,
-                "title": title,
-                "offset_ms": offset,
-                "duration_ms": duration,
-                "started_at": time.time(),
-            }
-        )
+        state = {
+            "pid": process.pid,
+            "player": player,
+            "base_url": base_url,
+            "token": token,
+            "part_key": part_key,
+            "rating_key": rating_key,
+            "title": title,
+            "offset_ms": offset,
+            "duration_ms": duration,
+            "started_at": time.time(),
+        }
+        _write_state(state)
+        _report_timeline("playing", state)
         log.info("[PlexAudio] Started %s (pid %s) for %s", player, process.pid, title or part_key)
         _print_payload(True, {"player": player, "pid": process.pid, "offset_ms": offset})
     except Exception as exc:
@@ -438,12 +470,15 @@ def plex_stop():
         state["pid"] = None
         state["offset_ms"] = position_ms
         _write_state(state)
+        _report_timeline("stopped", state)
     _print_payload(True, {"was_playing": was_playing, "position_ms": position_ms})
 
 
 def plex_status():
     state = _read_state()
     playing = bool(state and _pid_running(state.get("pid")))
+    if playing:
+        _report_timeline("playing", state)
     _print_payload(
         True,
         {
