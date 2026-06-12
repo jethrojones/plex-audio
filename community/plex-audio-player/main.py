@@ -1284,9 +1284,22 @@ class PlexAudioPlayerCapability(MatchingCapability):
             await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "on"})
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Music mode signal failed: {exc}")
+        # Best-effort: start the audio-reactive LED visualizer. Both cloud and
+        # LAN playback exit through the same PulseAudio sink, so the visualizer
+        # reads its monitor either way. Never let a failure here break playback.
+        try:
+            await self._devkit_call("leds_viz_start", [], 5)
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] LED visualizer start failed: {exc}")
 
     async def _music_mode_off(self):
         """Tear down music mode. Safe to call even if it was never turned on."""
+        # Best-effort: stop the LED visualizer so the platform can reclaim the
+        # strip. Never let a failure here break music-mode teardown.
+        try:
+            await self._devkit_call("leds_viz_stop", [], 5)
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] LED visualizer stop failed: {exc}")
         try:
             await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "off"})
         except Exception as exc:

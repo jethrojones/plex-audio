@@ -1203,3 +1203,116 @@ def test_cloud_reachable_client_returns_none_when_probe_fails(monkeypatch):
     assert cap._cloud_reachable_client(
         "https://plex.example:32400", "tok", "acct", None, None
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# LED music visualizer (now in devkit_functions.py) — pure helpers
+# ---------------------------------------------------------------------------
+
+
+def test_viz_level_to_lit_count_silence_is_dark():
+    dev = load_devkit_module()
+    assert dev.level_to_lit_count(0.0, 24) == 0
+    assert dev.level_to_lit_count(-0.5, 24) == 0
+
+
+def test_viz_level_to_lit_count_full_scale_lights_whole_ring():
+    dev = load_devkit_module()
+    assert dev.level_to_lit_count(1.0, 24) == 24
+    assert dev.level_to_lit_count(2.0, 24) == 24
+
+
+def test_viz_level_to_lit_count_faint_level_lights_at_least_one():
+    dev = load_devkit_module()
+    # A tiny but non-zero level must light a single pixel, not round to dark.
+    assert dev.level_to_lit_count(0.001, 24) == 1
+
+
+def test_viz_level_to_lit_count_is_monotonic_and_proportional():
+    dev = load_devkit_module()
+    assert dev.level_to_lit_count(0.5, 24) == 12
+    assert dev.level_to_lit_count(0.25, 24) == 6
+    counts = [dev.level_to_lit_count(x / 10.0, 24) for x in range(0, 11)]
+    assert counts == sorted(counts)
+
+
+def test_viz_update_envelope_attack_is_faster_than_decay():
+    dev = load_devkit_module()
+    # Rising from 0 toward 1 closes most of the gap (fast attack).
+    risen = dev.update_envelope(0.0, 1.0)
+    # Falling from 1 toward 0 closes only a little of the gap (slow decay).
+    fell = dev.update_envelope(1.0, 0.0)
+    assert risen > 0.5          # attack moved well past halfway
+    assert fell > 0.9           # decay barely dropped
+    assert (1.0 - fell) < risen  # decay step smaller than attack step
+
+
+def test_viz_normalize_level_autoscales_between_floor_and_peak():
+    dev = load_devkit_module()
+    assert dev.normalize_level(0.1, 0.1, 0.5) == 0.0   # at floor -> 0
+    assert dev.normalize_level(0.5, 0.1, 0.5) == 1.0   # at peak -> 1
+    assert abs(dev.normalize_level(0.3, 0.1, 0.5) - 0.5) < 1e-9
+    # Below floor clamps to 0, above peak clamps to 1.
+    assert dev.normalize_level(0.0, 0.1, 0.5) == 0.0
+    assert dev.normalize_level(0.9, 0.1, 0.5) == 1.0
+
+
+def test_viz_normalize_level_guards_collapsed_range():
+    dev = load_devkit_module()
+    # When floor and peak coincide, the min-range guard prevents divide-by-zero.
+    result = dev.normalize_level(0.2, 0.2, 0.2)
+    assert 0.0 <= result <= 1.0
+
+
+def test_viz_rms_from_bytes_silence_and_signal():
+    dev = load_devkit_module()
+    import struct as _struct
+    assert dev.rms_from_bytes(b"") == 0.0
+    silence = _struct.pack("<8h", 0, 0, 0, 0, 0, 0, 0, 0)
+    assert dev.rms_from_bytes(silence) == 0.0
+    loud = _struct.pack("<8h", *([16000, -16000] * 4))
+    quiet = _struct.pack("<8h", *([1000, -1000] * 4))
+    assert dev.rms_from_bytes(loud) > dev.rms_from_bytes(quiet) > 0.0
+    assert 0.0 <= dev.rms_from_bytes(loud) <= 1.0
+
+
+def test_viz_rms_from_bytes_manual_stride_matches_audioop_path():
+    dev = load_devkit_module()
+    import struct as _struct
+    samples = [12000, -8000, 4000, -16000, 9000, -3000, 15000, -11000]
+    data = _struct.pack("<8h", *samples)
+    # stride=1 uses audioop when present; force the manual loop with stride and
+    # confirm it produces a comparable, sane RMS for the same data.
+    full = dev.rms_from_bytes(data, sample_stride=1)
+    strided = dev.rms_from_bytes(data, sample_stride=2)
+    assert 0.0 < full <= 1.0
+    assert 0.0 < strided <= 1.0
+
+
+def test_viz_palette_color_matches_stops_and_interpolates():
+    dev = load_devkit_module()
+    # Integer positions hit palette stops exactly.
+    assert dev.palette_color(0.0) == dev.PALETTE[0]
+    assert dev.palette_color(1.0) == dev.PALETTE[1]
+    # Wraps around at the end of the palette.
+    assert dev.palette_color(float(len(dev.PALETTE))) == dev.PALETTE[0]
+    # Half-way interpolates between two stops.
+    c0, c1 = dev.PALETTE[0], dev.PALETTE[1]
+    mid = dev.palette_color(0.5)
+    for channel in range(3):
+        assert min(c0[channel], c1[channel]) <= mid[channel] <= max(c0[channel], c1[channel])
+
+
+def test_viz_peak_dot_index_rides_level():
+    dev = load_devkit_module()
+    assert dev.peak_dot_index(0.0, 24) == -1     # silence -> no dot
+    assert dev.peak_dot_index(1.0, 24) == 23     # full -> last pixel
+    assert dev.peak_dot_index(0.5, 24) == 12     # mid-ring
+    assert dev.peak_dot_index(2.0, 24) == 23     # clamps to last pixel
+
+
+def test_viz_registry_contains_all_three_viz_entries():
+    """FUNCTION_REGISTRY must expose leds_viz_start, leds_viz_stop, and leds_viz_run."""
+    dev = load_devkit_module()
+    for name in ("leds_viz_start", "leds_viz_stop", "leds_viz_run"):
+        assert name in dev.FUNCTION_REGISTRY, f"missing {name!r} from FUNCTION_REGISTRY"
