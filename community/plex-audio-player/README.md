@@ -6,145 +6,102 @@
 
 ## What It Does
 
-Plex Audio Player lets an OpenHome Agent search and play audio-only media from a user's Plex server, including music libraries and audiobook libraries.
+Plex Audio Player gives your OpenHome Agent voice control over the music and audiobooks on your own Plex server. You ask for something out loud, and it plays.
 
-It is a **Local Ability**. OpenHome splits every Ability across two runtimes: `main.py` always executes in the standard Ability runtime (OpenHome's cloud), and `devkit_functions.py` executes on the OpenHome DevKit. This Ability puts all Plex network access and audio playback on the DevKit side, so the cloud runtime never needs a route to the Plex server. A Plex server that is only reachable on the home LAN works fine — no Remote Access, port forwarding, or public `plex.direct` URL required.
+- **Play by artist or title** — "play Metallica from Plex", "play Kind of Blue".
+- **Continuous queues** — when you pick an artist or album, it keeps playing track after track instead of stopping after one song.
+- **Next / skip** — say "next" or "skip" to jump to the following track.
+- **Mid-song switching** — say "play something else" (e.g. "play the Beatles") while music is playing and it searches and switches without you having to stop first.
+- **Stop / pause** — say "stop", "pause", or "stop the music" any time.
+- **Audiobook resume** — start an audiobook, come back later, and say "continue my audiobook" to pick up where you left off.
 
-Version 1 includes audiobook resume support: after an audiobook starts, the Ability stores the last audiobook and an approximate playback position in OpenHome Ability context storage, so users can say "continue my audiobook" or "resume my book" later.
+Under the hood it can play your Plex audio in two ways. The **preferred** way streams through the OpenHome cloud using your linked Plex account — it works out of the box with no device or network setup. The **backup** way plays directly over your home network (LAN) from an OpenHome DevKit, which is lower latency and works without internet but requires an audio player installed on the device.
 
-It is designed as the first provider in a broader personal-audio pattern. The code keeps the provider logic separated so similar self-hosted audio platforms such as Jellyfin, Audiobookshelf, Navidrome, and Emby can be added later.
+## Quick Start (Preferred): Link Your Plex Account
 
-## Suggested Trigger Words
+This is all most people need.
 
-- "play from Plex"
-- "Plex music"
-- "play my audiobook"
-- "Plex audiobook"
-- "continue my audiobook"
-- "resume my book"
-- "play music from my server"
+1. **Enable Remote Access on your Plex server.** In Plex: **Settings → Remote Access → Enable Remote Access**. Wait for the indicator to turn **green**. This lets OpenHome's cloud reach your Plex server from outside your home.
+2. **Say "link my Plex account."** The Agent reads out a short 4-character code.
+3. **Enter the code at [plex.tv/link](https://plex.tv/link)** on your phone or computer, then sign in to Plex if prompted.
+4. **Done.** The Agent confirms your account is linked. You can now ask it to play music or audiobooks, and it streams them through the OpenHome cloud directly from your Plex server.
 
-## Setup
+No API keys, no URLs, no device to configure. The link is remembered, so you only do this once.
 
-1. Package and upload the Ability (see the repo README), set its category to **Local** in the OpenHome dashboard, and sync it to your DevKit from the Live Editor's Local Abilities controls.
-2. Make sure the DevKit and the Plex server are on the same network (or on routable subnets).
-3. Make sure the DevKit has an audio player binary. OpenHome OS is Debian-based; `mpv` is recommended: `sudo apt install mpv`. The Ability auto-detects `mpv`, `ffplay`, `cvlc`, or `mpg123`, in that order.
+## LAN Backup Mode (Optional, Advanced)
 
-**Minimal setup — no token needed:** if your Plex server is allowed to run on your local network without auth (Plex Web App → **Settings → Server → Network → List of IP addresses and networks that are allowed without auth**, e.g. `10.0.0.0/24`), the only key you need is `plex_base_url` with the Plex LAN IP and port, such as `http://10.0.0.136:32400`. No `plex_token` is required.
+If you run an **OpenHome DevKit on the same network as your Plex server**, the Ability can play directly over the LAN. This is lower latency and keeps working even when your internet is down, because the audio never leaves your home network.
 
-This Ability can find Plex in two ways:
+This mode is **optional** and **automatic**:
 
-1. **Manual URL override**: set `plex_base_url` to the Plex server URL as seen **from the DevKit**, such as `http://10.0.0.136:32400`.
-2. **Plex.tv resource discovery**: set `plex_account_token` so the Ability can ask Plex.tv for the server's advertised connection URLs. Discovery prefers LAN connection URLs, which the DevKit can reach. OpenHome blocks raw `socket` imports in `main.py`, so multicast LAN discovery is not available.
+- When a Plex account is linked, **cloud streaming is used** as the primary path.
+- LAN playback is the **automatic backup** — used if cloud streaming is unavailable.
+- When **no account is linked**, LAN playback becomes the **primary** path.
 
-Recommended OpenHome custom API key values:
+### Requirements for LAN mode
 
-- `plex_base_url` — base URL for the user's Plex server, reachable from the DevKit.
-- `plex_token` — optional server auth token. This is not required if Plex allows the DevKit subnet under **Settings → Server → Network → List of IP addresses and networks that are allowed without auth**.
-- `plex_account_token` — optional Plex account token for Plex.tv resource discovery.
-- `plex_server_name` — optional Plex server name to choose when the Plex account has multiple servers.
-- `plex_machine_identifier` — optional Plex machine identifier to choose one exact server.
+- An **audio player binary on the device.** Raspberry Pi OS does **not** ship one preinstalled, so install one:
 
-### Important Network Note
+  ```bash
+  sudo apt install mpv
+  ```
 
-This is a Local Ability, so the network requirement depends on which path is active:
+  The Ability auto-detects `mpv`, `ffplay`, `cvlc`, or `mpg123`, in that order. `mpv` is recommended.
+- The DevKit and the Plex server on the **same network** (or routable subnets), and the Ability synced to the DevKit as a **Local Ability** from the Live Editor.
 
-- **DevKit path (preferred)**: only the **DevKit** needs to reach `plex_base_url`. A LAN URL like `http://10.0.0.x:32400` is the right choice, and multi-router/double-NAT homes need no port forwarding at all.
-- **Cloud fallback (no DevKit connected)**: the standard runtime streams the audio itself, so `plex_base_url` must be reachable from the internet — a verified `plex.direct` Remote Access URL, or a tunnel such as Tailscale Funnel in front of port 32400.
-- Do not publish a real Plex token or private home URL in this repo.
+In LAN mode the audio plays from a local player process on the DevKit rather than through the cloud, so a Plex server that is only reachable on your home LAN (no Remote Access required) works fine.
 
-Quick reachability checks:
+## Voice Commands
 
-- `http://LAN-IP:32400/identity?X-Plex-Token=TOKEN` should work from any device on the Plex server's network — this is what the DevKit path uses.
-- `https://...plex.direct:PORT/identity?X-Plex-Token=TOKEN` should work from outside the network before relying on the cloud fallback path. Plex Remote Access setup (UPnP or manual port forward plus **Manually specify public port**) is documented at https://support.plex.tv/articles/200289506-remote-access/.
+| You say | What happens |
+| --- | --- |
+| "play Metallica from Plex" | Searches your Plex audio and starts a continuous queue. |
+| "play Kind of Blue" | Plays the album/track and keeps going through related tracks. |
+| "play music" / "play something" | Browses your music libraries and plays. |
+| "next" / "skip" | Jumps to the next track in the queue. |
+| "play the Beatles" *(while music is playing)* | Switches mid-song: searches and starts the new request. |
+| "stop" / "pause" / "stop the music" | Stops playback. |
+| "continue my audiobook" / "resume my book" | Resumes your last audiobook from where you left off. |
+| "link my Plex account" | Starts the account-linking flow (see Quick Start). |
 
-### Playback Behavior on the DevKit
+Tip: while music is playing near the microphone, only short commands are treated as stop/skip, and negations ("don't stop") are ignored, so song lyrics the mic picks up don't trigger anything by accident.
 
-- Audio plays from a local player process on the DevKit, not through OpenHome's cloud audio pipeline.
-- While playing, the Ability listens in short windows for stop commands ("stop", "pause", "stop the music"). Longer sentences are ignored to avoid false triggers from lyrics the microphone picks up.
-- Audiobook resume positions are computed on the DevKit from actual playback time, which makes "continue my audiobook" more accurate than the previous cloud-streaming estimate.
+## Optional API Keys (Manual Configuration)
 
-### Getting a Plex Token
+You normally don't need any of these — account linking handles everything. They exist for advanced or manual setups, and are configured via OpenHome's custom API key screen:
 
-Plex's token documentation says authenticated server endpoints use the `X-Plex-Token` URL parameter, for example `http://localhost:32400/?X-Plex-Token=YOURTOKENVALUEHERE`. To find a token, sign in to Plex Web App, browse to a library item, view XML for it, and copy the `X-Plex-Token` value from the URL. Treat it like a password.
+- `plex_base_url` — your Plex server URL, e.g. `http://10.0.0.136:32400` (LAN) or a remote `plex.direct` URL. Skips discovery.
+- `plex_token` — a Plex server auth token (the `X-Plex-Token` value). Not needed if your Plex network allows the device subnet without auth.
+- `plex_account_token` — a Plex account token for Plex.tv resource discovery (an alternative to the spoken link flow).
+- `plex_server_name` — pick a specific server by name when your account has several.
+- `plex_machine_identifier` — pick one exact server by its machine identifier.
 
-Provider URL suggestion for the OpenHome key setup screen:
+To find a token manually: sign in to the Plex Web App, open a library item, choose **Get Info → View XML**, and copy the `X-Plex-Token` value from the URL. Treat it like a password and do not commit it to a repo.
 
-- `plex_base_url`: `https://support.plex.tv/articles/200289506-remote-access/`
-- `plex_token`: `https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/`
-- `plex_account_token`: `https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/`
+## Troubleshooting
+
+- **"I couldn't find that"** — Check that the artist/title matches what's actually in your Plex library. Try the exact album, artist, or book name. Generic requests like "play music" browse everything.
+- **Device not reachable (LAN mode)** — Make sure the DevKit is powered on, on the same network as Plex, and that the Ability is synced to it as a Local Ability. Confirm an audio player is installed (`sudo apt install mpv`).
+- **No remote streaming / cloud playback fails** — Re-link your account ("link my Plex account") and confirm Plex **Remote Access** shows **green** in your server settings. Cloud streaming needs the OpenHome cloud to reach your server from the internet.
+- **Token rejected** — If you set `plex_token` or `plex_account_token` manually, the value may be stale. Re-copy it, or use the spoken link flow instead.
 
 ## How It Works
 
-1. The user triggers the Ability and asks for music or an audiobook.
-2. The Ability first uses `plex_base_url` if present. Otherwise it tries Plex.tv resource discovery with `plex_account_token`.
-3. `main.py` asks the DevKit to run `plex_diagnose`, confirming the DevKit can reach Plex and has an audio player installed. If not, it falls back to cloud streaming.
-4. The DevKit searches Plex for audio tracks using Plex's XML API (`plex_search`), filters to `Track` media, and infers music vs audiobook from library metadata and duration.
-5. `main.py` picks the best match for the spoken request.
-6. For audiobooks, it saves the selected item and resume offset in Ability context storage.
-7. If the user asks to continue/resume, it reloads the saved audiobook and starts from the saved offset.
-8. The DevKit plays the audio from Plex through a local player process (`plex_play`), while `main.py` polls playback status and listens for stop commands.
-9. It always returns control to the Agent with `resume_normal_flow()`.
-
-## Example Conversation
-
-> **User:** "Play the audiobook Dune from Plex."
->
-> **AI:** "Searching your Plex audio libraries."
->
-> **AI:** "Playing Dune, Chapter 1 from Plex."
-
-> **User:** "Continue my audiobook."
->
-> **AI:** "Resuming Dune, Chapter 1 from Plex."
-
-> **User:** "Plex music, Miles Davis Kind of Blue."
->
-> **AI:** "Searching your Plex audio libraries."
->
-> **AI:** "Playing So What by Miles Davis from Kind of Blue from Plex."
-
-## Current Scope
-
-This first version supports:
-
-- Plex music libraries
-- Plex audiobook libraries that appear as audio tracks
-- "Continue my audiobook" / "resume my book" using persisted Ability context
-- Natural-language search requests
-- Music vs audiobook preference based on the request
-- Audio streaming from Plex media parts
-- Clear setup errors for missing/unreachable Plex discovery configuration
-
-### Resume Behavior
-
-Resume is intentionally audiobook-focused for v1.
-
-- The Ability stores only audiobook resume state, not music tracks.
-- The saved state key is `plex_audio_last_audiobook`.
-- The offset is approximate because the first OpenHome SDK path streams audio but does not yet expose precise playback-position callbacks.
-- If playback reaches the last minute of the item, the saved offset resets to the beginning.
-
-## Future Provider Ideas
-
-The next versions could add:
-
-- Jellyfin audio libraries
-- Audiobookshelf audiobook libraries
-- Navidrome/Subsonic music libraries
-- Emby audio libraries
-- Playlist and album queueing
-- More precise Plex scrobble/playback-state integration when OpenHome exposes richer playback callbacks
+1. You trigger the Ability and ask for music or an audiobook.
+2. If a Plex account is linked (or `plex_account_token` is set) and the OpenHome cloud can reach your server, the Ability streams audio **through the cloud** — the preferred path. Selecting this path skips the DevKit diagnostic, so playback starts faster.
+3. Otherwise it falls back to the **DevKit/LAN** path: it confirms the DevKit can reach Plex and has an audio player, then plays locally.
+4. It searches your Plex audio libraries, scores the matches against your spoken request, and picks the best one (music vs audiobook is inferred from library metadata and track length).
+5. Music plays as a **continuous queue** with voice stop, next/skip, and mid-song switching. Audiobooks play as a single long track, and the position is saved so you can resume later.
+6. Control returns to the Agent when playback ends or you stop it.
 
 ## Developer Notes
 
 Run local checks from the repo root:
 
 ```bash
-pytest tests/test_plex_audio_player.py -q
-python validate_ability.py community/plex-audio-player
+python3 -m pytest tests/ -q
+python3 -m py_compile community/plex-audio-player/main.py
+python3 validate_ability.py community/plex-audio-player
 ```
 
-The Ability intentionally uses OpenHome's custom API key mechanism instead of hardcoded secrets. Trigger words are configured in the OpenHome dashboard, not in code.
-
-Packaging note: keep test stubs and helper-only imports out of `main.py`. The OpenHome editor blocks some stdlib modules/import patterns, including `from types import ...`, `from urllib.parse import ...`, and `import urllib.parse`. This Ability avoids `urllib` entirely and uses a tiny local query-string encoder for Plex URLs; local tests may still use `types.ModuleType` for SDK stubs.
+The OpenHome cloud validator forbids some Python patterns (raw `socket`/`urllib` imports, `getattr`, `asyncio.sleep`). The Ability avoids all of them: it uses a tiny local query-string encoder for Plex URLs, `hasattr` guards for optional runtime features, and `worker.session_tasks.sleep()` for delays. Trigger words and API keys are configured in the OpenHome dashboard, not in code.

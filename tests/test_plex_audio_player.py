@@ -1024,3 +1024,182 @@ def test_choose_best_connection_default_behavior_unchanged_when_prefer_remote_fa
     # And with no preferred subnets, it picks the first local candidate as before.
     chosen_local = mod.choose_best_plex_connection(connections)
     assert chosen_local["base_url"] == "http://192.168.0.20:32400"
+
+
+# ---------------------------------------------------------------------------
+# Cloud-primary restructure: mode-selection + cloud queue plumbing
+# ---------------------------------------------------------------------------
+
+
+class _FakeLogger:
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass
+
+
+class _FakeWorker:
+    def __init__(self):
+        self.editor_logging_handler = _FakeLogger()
+
+
+def _make_capability(mod):
+    """Instantiate the capability with fakes (no MatchingCapability __init__ needed)."""
+    cap = mod.PlexAudioPlayerCapability()
+    cap.worker = _FakeWorker()
+    cap.capability_worker = None
+    return cap
+
+
+def test_new_cloud_methods_exist():
+    """The cloud-primary restructure must expose these methods."""
+    mod = load_ability_module()
+    for name in (
+        "_cloud_reachable_client",
+        "_probe_cloud_connection",
+        "_report_cloud_timeline",
+        "_stream_queue",
+        "_stream_one_track",
+        "_cancel_streamer",
+    ):
+        assert hasattr(mod.PlexAudioPlayerCapability, name), f"missing {name}"
+
+
+def test_report_cloud_timeline_builds_expected_request(monkeypatch):
+    """Timeline scrobble must hit /:/timeline with the playback state + position."""
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    client = mod.PlexAudioClient("https://plex.example:32400", "tok")
+    item = mod.PlexAudioItem("So What", "Miles Davis", "Kind of Blue", "music", "/p.mp3", 545000, "rk42")
+
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append((url, timeout))
+        return None
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    cap._report_cloud_timeline(client, item, "playing", 12000)
+
+    assert len(calls) == 1
+    url, timeout = calls[0]
+    assert url.startswith("https://plex.example:32400/:/timeline?")
+    assert "ratingKey=rk42" in url
+    assert "state=playing" in url
+    assert "time=12000" in url
+    assert "duration=545000" in url
+    assert timeout == 5
+
+
+def test_report_cloud_timeline_skips_item_without_rating_key(monkeypatch):
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    client = mod.PlexAudioClient("https://plex.example:32400", "tok")
+    item = mod.PlexAudioItem("Unknown", "Artist", "", "music", "/p.mp3", 0, "")
+
+    calls = []
+    monkeypatch.setattr(mod.requests, "get", lambda url, timeout=None: calls.append(url))
+    cap._report_cloud_timeline(client, item, "stopped", 0)
+
+    assert calls == []
+
+
+def test_report_cloud_timeline_swallows_request_errors(monkeypatch):
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    client = mod.PlexAudioClient("https://plex.example:32400", "tok")
+    item = mod.PlexAudioItem("So What", "Miles Davis", "Kind of Blue", "music", "/p.mp3", 545000, "rk42")
+
+    def boom(url, timeout=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(mod.requests, "get", boom)
+    # Must not raise — timeline reporting is strictly best-effort.
+    cap._report_cloud_timeline(client, item, "playing", 0)
+
+
+def test_cloud_reachable_client_probes_non_local_base_url_directly(monkeypatch):
+    """A non-local configured base_url is probed as-is; no plex.tv discovery."""
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+
+    discovery_called = []
+    monkeypatch.setattr(
+        mod,
+        "discover_plex_tv_resource",
+        lambda *a, **k: discovery_called.append(True),
+    )
+
+    probed = []
+
+    def fake_get(url, timeout=None):
+        probed.append(url)
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+        return _Resp()
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+
+    client = cap._cloud_reachable_client(
+        "https://plex.example:32400", "tok", "acct", None, None
+    )
+
+    assert client is not None
+    assert client.base_url == "https://plex.example:32400"
+    assert discovery_called == []  # never consulted plex.tv for a remote URL
+    assert any("/identity" in u for u in probed)
+
+
+def test_cloud_reachable_client_uses_remote_discovery_for_local_base_url(monkeypatch):
+    """A local base_url forces plex.tv discovery for a remote-access connection."""
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+
+    monkeypatch.setattr(
+        mod,
+        "discover_plex_tv_resource",
+        lambda *a, **k: {
+            "base_url": "https://1-2-3-4.example.plex.direct:32400",
+            "token": "remote-tok",
+        },
+    )
+
+    def fake_get(url, timeout=None):
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+        return _Resp()
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+
+    client = cap._cloud_reachable_client(
+        "http://10.0.0.136:32400", "tok", "acct", None, None
+    )
+
+    assert client is not None
+    assert client.base_url == "https://1-2-3-4.example.plex.direct:32400"
+    assert client.token == "remote-tok"
+
+
+def test_cloud_reachable_client_returns_none_when_probe_fails(monkeypatch):
+    """A non-local base_url that fails the /identity probe yields no cloud client."""
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+
+    def boom(url, timeout=None):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(mod.requests, "get", boom)
+    monkeypatch.setattr(mod, "discover_plex_tv_resource", lambda *a, **k: None)
+
+    assert cap._cloud_reachable_client(
+        "https://plex.example:32400", "tok", "acct", None, None
+    ) is None

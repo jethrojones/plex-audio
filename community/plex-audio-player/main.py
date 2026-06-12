@@ -1012,7 +1012,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 return data
             logger.warning(f"[PlexAudio] DevKit diagnose attempt {attempt + 1} failed: {error}")
             if attempt == 0:
-                await asyncio.sleep(3)
+                await self.worker.session_tasks.sleep(3)
         return None
 
     async def _devkit_search(self, client, user_request):
@@ -1385,9 +1385,279 @@ class PlexAudioPlayerCapability(MatchingCapability):
             )
         return None
 
+    def _cloud_reachable_client(self, base_url, token, account_token, server_name, machine_identifier):
+        """Find a Plex connection the OpenHome cloud runtime can reach directly.
+
+        Cloud streaming needs a route to Plex from the cloud, which a LAN address
+        does not provide. When the configured base_url is already non-local, probe
+        it as-is. Otherwise ask Plex.tv for a genuinely remote (Remote Access)
+        connection. Returns a ready PlexAudioClient on a successful probe, or None.
+        """
+        logger = self.worker.editor_logging_handler
+        if base_url and not _url_is_local(base_url):
+            candidate = PlexAudioClient(base_url, token, logger)
+            if self._probe_cloud_connection(candidate):
+                return candidate
+            return None
+        connection = discover_plex_tv_resource(
+            account_token,
+            server_name=server_name,
+            machine_identifier=machine_identifier,
+            preferred_subnets=None,
+            logger=logger,
+            prefer_remote=True,
+        )
+        if connection and connection.get("base_url"):
+            candidate = PlexAudioClient(
+                connection.get("base_url"),
+                connection.get("token") or account_token,
+                logger,
+            )
+            if self._probe_cloud_connection(candidate):
+                return candidate
+        return None
+
+    def _probe_cloud_connection(self, client):
+        """True when GET /identity on the connection responds OK from the cloud."""
+        try:
+            response = requests.get(client.url("/identity"), timeout=5)
+            response.raise_for_status()
+            return True
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(
+                f"[PlexAudio] Cloud reachability probe failed for {client.base_url}: {exc}"
+            )
+            return False
+
+    def _report_cloud_timeline(self, client, item, state, position_ms):
+        """Best-effort Plex timeline scrobble so playback shows as Now Playing.
+
+        Fully optional: any failure is swallowed so it never disrupts playback.
+        """
+        if not item or not item.rating_key:
+            return
+        try:
+            duration_ms = int(item.duration_ms or 0)
+        except (TypeError, ValueError):
+            duration_ms = 0
+        try:
+            position = max(0, int(position_ms or 0))
+        except (TypeError, ValueError):
+            position = 0
+        params = {
+            "ratingKey": item.rating_key,
+            "key": f"/library/metadata/{item.rating_key}",
+            "state": state,
+            "time": str(position),
+            "duration": str(duration_ms),
+            "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
+            "X-Plex-Product": "OpenHome PlexAudio",
+            "X-Plex-Version": "1.0",
+            "X-Plex-Platform": "Cloud",
+        }
+        try:
+            requests.get(client.url("/:/timeline", params), timeout=5)
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(
+                f"[PlexAudio] Timeline report ({state}) failed: {exc}"
+            )
+
+    async def _stream_one_track(self, client, item, status, offset_ms=0):
+        """Background streamer for a single track. Mutates `status` (a dict).
+
+        status keys it sets:
+          "finished" — True once the HTTP stream is fully drained naturally.
+          "stopped"  — True if the stop event fired and we tore the stream down.
+        Always calls stream_end() in finally so the device audio channel closes.
+        """
+        stream_url = client.stream_url_for(item, offset_ms=offset_ms)
+        stream_started = False
+        try:
+            response = requests.get(stream_url, timeout=REQUEST_TIMEOUT, stream=True)
+            response.raise_for_status()
+            if not hasattr(self.capability_worker, "stream_init"):
+                # Runtime without chunked streaming: fall back to a single buffer.
+                await self.capability_worker.play_audio(response.content)
+                status["finished"] = True
+                return
+            await self.capability_worker.stream_init()
+            stream_started = True
+            for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+                if hasattr(self.worker, "music_mode_stop_event") and self.worker.music_mode_stop_event.is_set():
+                    status["stopped"] = True
+                    return
+                # Pause: hold the chunk and idle while the platform pause event is set.
+                while hasattr(self.worker, "music_mode_pause_event") and self.worker.music_mode_pause_event.is_set():
+                    if hasattr(self.worker, "music_mode_stop_event") and self.worker.music_mode_stop_event.is_set():
+                        status["stopped"] = True
+                        return
+                    await self.worker.session_tasks.sleep(0.2)
+                if chunk:
+                    await self.capability_worker.send_audio_data_in_stream(chunk, chunk_size=STREAM_CHUNK_SIZE)
+            status["finished"] = True
+        finally:
+            if stream_started:
+                try:
+                    await self.capability_worker.stream_end()
+                except Exception as exc:
+                    self.worker.editor_logging_handler.warning(
+                        f"[PlexAudio] stream_end during cleanup failed: {exc}"
+                    )
+
+    async def _stream_queue(self, client, queue, user_request):
+        """Cloud-primary continuous queue player with DevKit feature parity.
+
+        Streams each track in a background task while the main coroutine listens
+        for spoken commands (stop / next-skip / play-something-else) and advances
+        the queue when a track's HTTP stream is exhausted naturally.
+        """
+        await self._music_mode_on()
+        overall_started = time.monotonic()
+        index = 0
+        offset_ms = 0
+        streamer = None
+        status = None
+        current_item = None
+        track_started = None
+        last_heard_text = None
+        last_heard_at = None
+        try:
+            while index < len(queue):
+                if time.monotonic() - overall_started >= MAX_PLAYBACK_SECONDS:
+                    break
+                # (Re)start the streamer for the current track when needed.
+                if streamer is None:
+                    current_item = queue[index]
+                    status = {"finished": False, "stopped": False}
+                    track_started = time.monotonic()
+                    self._report_cloud_timeline(client, current_item, "playing", offset_ms)
+                    streamer = self.worker.session_tasks.create(
+                        self._stream_one_track(client, current_item, status, offset_ms=offset_ms)
+                    )
+
+                # Listen for a spoken command with a short timeout so we also
+                # poll the streamer's natural end and the platform stop/pause
+                # events promptly.
+                heard = None
+                try:
+                    heard = await asyncio.wait_for(
+                        self.capability_worker.user_response(),
+                        timeout=3,
+                    )
+                except asyncio.TimeoutError:
+                    heard = None
+                except Exception as exc:
+                    self.worker.editor_logging_handler.warning(
+                        f"[PlexAudio] Cloud listen failed: {exc}"
+                    )
+                    heard = None
+
+                now = time.monotonic()
+                if is_stale_repeat(heard, last_heard_text, last_heard_at, now):
+                    heard = None
+                elif normalize_text(heard):
+                    last_heard_text = heard
+                    last_heard_at = now
+
+                stop_event_set = (
+                    hasattr(self.worker, "music_mode_stop_event")
+                    and self.worker.music_mode_stop_event.is_set()
+                )
+
+                # 1) Stop wins over everything (platform event or spoken command).
+                if stop_event_set or (heard and playback_stop_requested(heard)):
+                    if hasattr(self.worker, "music_mode_stop_event"):
+                        self.worker.music_mode_stop_event.set()
+                    elapsed_ms = int((time.monotonic() - (track_started or now)) * 1000)
+                    await self._cancel_streamer(streamer)
+                    streamer = None
+                    self._report_cloud_timeline(client, current_item, "stopped", offset_ms + elapsed_ms)
+                    await self.capability_worker.speak("Okay, stopping Plex.")
+                    return
+
+                # 2) Track finished naturally → advance.
+                if status and status["finished"]:
+                    await self._cancel_streamer(streamer)
+                    streamer = None
+                    self._report_cloud_timeline(
+                        client, current_item, "stopped", offset_ms + int(current_item.duration_ms or 0)
+                    )
+                    index += 1
+                    offset_ms = 0
+                    continue
+
+                # 2b) Streamer stopped because the stop event fired mid-chunk but
+                # we did not catch it above (race): treat as a stop.
+                if status and status["stopped"]:
+                    streamer = None
+                    self._report_cloud_timeline(
+                        client, current_item, "stopped", offset_ms + int((now - (track_started or now)) * 1000)
+                    )
+                    await self.capability_worker.speak("Okay, stopping Plex.")
+                    return
+
+                if not heard:
+                    continue
+
+                # 3) Skip / next.
+                if playback_skip_requested(heard):
+                    await self._cancel_streamer(streamer)
+                    streamer = None
+                    self._report_cloud_timeline(
+                        client, current_item, "stopped", offset_ms + int((now - (track_started or now)) * 1000)
+                    )
+                    await self.capability_worker.speak("Okay, next.")
+                    index += 1
+                    offset_ms = 0
+                    continue
+
+                # 4) Mid-song switch: "play something else".
+                if playback_new_request(heard):
+                    elapsed_ms = int((now - (track_started or now)) * 1000)
+                    await self._cancel_streamer(streamer)
+                    streamer = None
+                    self._report_cloud_timeline(client, current_item, "stopped", offset_ms + elapsed_ms)
+                    await self.capability_worker.speak("Searching.")
+                    new_items = client.search_audio(heard)
+                    new_choice = choose_best_item(new_items, heard)
+                    if new_choice:
+                        await self.capability_worker.speak(f"Playing {describe_item(new_choice)} from Plex.")
+                        queue = build_music_queue(new_items, new_choice)
+                        index = 0
+                        offset_ms = 0
+                        continue
+                    await self.capability_worker.speak("I couldn't find that. Continuing the music.")
+                    # Resume the SAME track from where it left off.
+                    offset_ms = offset_ms + elapsed_ms
+                    continue
+            return
+        finally:
+            if streamer is not None:
+                await self._cancel_streamer(streamer)
+
+    async def _cancel_streamer(self, streamer):
+        """Cancel a background streamer task and wait for its finally to run."""
+        if streamer is None:
+            return
+        try:
+            streamer.cancel()
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(
+                f"[PlexAudio] Streamer cancel failed: {exc}"
+            )
+        try:
+            await streamer
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(
+                f"[PlexAudio] Streamer await-after-cancel failed: {exc}"
+            )
+
     async def run(self):
         base_url = ""
         devkit_mode = False
+        cloud_mode = False
         # Reset per-session so a reused capability instance never thinks a prior
         # session's playback is still active.
         self._devkit_playback_started = False
@@ -1406,15 +1676,35 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 )
                 return
             base_url = client.base_url
-
-            # Preferred path: the DevKit reaches Plex over the LAN and plays locally,
-            # so the cloud runtime never needs a route to the Plex server.
-            devkit_info = await self._devkit_diagnose(client.base_url, client.token)
             _link_guidance = (
                 " If Plex remote access is enabled, say link my Plex account, "
                 "and I can stream from outside your network when the local connection is down."
             )
-            if devkit_info is None:
+
+            # Preferred path (cloud-primary): now that account linking works out of
+            # the box, stream from Plex through the OpenHome cloud whenever the cloud
+            # runtime can reach the server (a non-local base_url, or a Remote Access
+            # connection discovered via the linked account). Selecting cloud mode
+            # skips the ~25s DevKit diagnose entirely. The LAN/DevKit path is the
+            # automatic backup (and the primary when no account is linked).
+            account_token_effective = account_token or self._linked_token()
+            if account_token_effective:
+                cloud_client = self._cloud_reachable_client(
+                    base_url, client.token, account_token_effective, server_name, machine_identifier
+                )
+                if cloud_client:
+                    client = cloud_client
+                    base_url = client.base_url
+                    cloud_mode = True
+                    devkit_mode = False
+
+            # Backup path: the DevKit reaches Plex over the LAN and plays locally,
+            # so the cloud runtime never needs a route to the Plex server. Only run
+            # the (slow) DevKit diagnose when cloud-primary was not selected.
+            devkit_info = None if cloud_mode else await self._devkit_diagnose(client.base_url, client.token)
+            if cloud_mode:
+                pass
+            elif devkit_info is None:
                 if _url_is_local(client.base_url):
                     # The DevKit is down and the only known Plex address is on the
                     # LAN, which the cloud runtime cannot reach. Before giving up,
@@ -1573,12 +1863,20 @@ class PlexAudioPlayerCapability(MatchingCapability):
             i = 0
             offset = 0
             await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
+            # Cloud-primary path: continuous queue playback with voice stop/skip
+            # and mid-song switching, matching the DevKit feature set.
+            if cloud_mode:
+                await self._stream_queue(client, queue, user_request)
+                return
             if devkit_mode:
                 await self._music_mode_on()
             while i < len(queue):
                 if not devkit_mode:
+                    # Non-cloud, non-devkit fallback (rare remote-access streaming
+                    # without an account link): single-track playback, no end
+                    # detection in this branch.
                     await self._stream_audio(client.stream_url_for(queue[i]))
-                    return  # cloud path cannot detect track end, play one track only
+                    return
                 position_ms, action, payload = await self._devkit_playback(
                     client, queue[i], offset, allow_switch=True
                 )
