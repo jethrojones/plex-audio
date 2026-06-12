@@ -555,3 +555,46 @@ def test_devkit_search_browse_all_for_generic_request():
     items = dev.search_plex_audio("http://10.0.0.136:32400", "tok", "play music", get_text=fake_get)
 
     assert len(items) == 2
+
+
+def test_playback_skip_requested_detects_short_next_and_skip_commands():
+    mod = load_ability_module()
+
+    assert mod.playback_skip_requested("next")
+    assert mod.playback_skip_requested("skip")
+    assert mod.playback_skip_requested("next song please")
+    assert mod.playback_skip_requested("skip this song")
+    assert not mod.playback_skip_requested("stop")
+    assert not mod.playback_skip_requested(
+        "don't skip a beat in this long noisy transcription of lyrics next"
+    )
+    assert not mod.playback_skip_requested("")
+
+
+def test_playback_new_request_detects_play_mid_playback():
+    mod = load_ability_module()
+
+    assert mod.playback_new_request("play 3 doors down")
+    assert mod.playback_new_request("play metallica from plex")
+    assert not mod.playback_new_request("stop playing")  # stop wins
+    assert not mod.playback_new_request("next")
+    assert not mod.playback_new_request("i love this playlist")  # \bplay\b must not match "playlist"
+    assert not mod.playback_new_request("")
+
+
+def test_build_music_queue_prefers_same_artist_then_falls_back_to_wraparound():
+    mod = load_ability_module()
+    choice = mod.PlexAudioItem("Enter Sandman", "Metallica", "Metallica", "music", "/m1.mp3", 330000, "m1")
+    other_metallica = mod.PlexAudioItem("One", "Metallica", "...And Justice", "music", "/m2.mp3", 446000, "m2")
+    third_metallica = mod.PlexAudioItem("Fade to Black", "Metallica", "Ride the Lightning", "music", "/m3.mp3", 418000, "m3")
+    unrelated = mod.PlexAudioItem("So What", "Miles Davis", "Kind of Blue", "music", "/jz.mp3", 545000, "jz")
+
+    # Two or more same-artist items: choice first, then other same-artist tracks only.
+    items = [choice, other_metallica, unrelated, third_metallica]
+    queue = mod.build_music_queue(items, choice)
+    assert [it.part_key for it in queue] == ["/m1.mp3", "/m2.mp3", "/m3.mp3"]
+
+    # Single same-artist match: fall back to wrap-around of all items starting at choice.
+    single_items = [unrelated, choice]
+    single_queue = mod.build_music_queue(single_items, choice)
+    assert [it.part_key for it in single_queue] == ["/m1.mp3", "/jz.mp3"]

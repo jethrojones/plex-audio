@@ -37,7 +37,7 @@ except Exception:  # standalone/local test runs without devkit_utils
 
 REQUEST_TIMEOUT = 15
 AUDIO_SEARCH_TYPE = "10"
-MAX_SEARCH_RESULTS = 12
+MAX_SEARCH_RESULTS = 30
 STATE_FILE = "/home/openhome/.plex_audio_state.json"
 MPV_IPC_SOCKET = "/tmp/mpv-plex.sock"
 PLAYER_PRIORITY = ["mpv", "ffplay", "cvlc", "mpg123"]

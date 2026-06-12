@@ -25,7 +25,7 @@ DEVKIT_DIAGNOSE_TIMEOUT = 25
 DEVKIT_SEARCH_TIMEOUT = 45
 DEVKIT_PLAY_TIMEOUT = 20
 DEVKIT_CONTROL_TIMEOUT = 15
-PLAYBACK_LISTEN_WINDOW_SECONDS = 15
+PLAYBACK_LISTEN_WINDOW_SECONDS = 5
 MAX_PLAYBACK_SECONDS = 12 * 60 * 60
 STOP_WORDS = {"stop", "pause", "quit", "exit", "cancel", "enough", "done"}
 STOP_PHRASES = [
@@ -158,6 +158,28 @@ def choose_best_item(items, user_text):
         return None
     requested_type = detect_requested_media_type(user_text)
     return max(items, key=lambda item: score_item(item, user_text, requested_type))
+
+
+def build_music_queue(items, choice):
+    """Build the playback queue for a music choice.
+
+    Prefer keeping the same artist: if at least two music items share the
+    chosen item's creator, play the choice first then the remaining
+    same-artist tracks in their existing (score) order. Otherwise fall back
+    to a wrap-around of all items starting at the choice.
+    """
+    same_artist = [
+        it
+        for it in items
+        if it.media_type == "music" and normalize_text(it.creator) == normalize_text(choice.creator)
+    ]
+    if len(same_artist) >= 2:
+        return [choice] + [it for it in same_artist if it.part_key != choice.part_key]
+    try:
+        start_idx = next(i for i, it in enumerate(items) if it.part_key == choice.part_key)
+    except StopIteration:
+        start_idx = 0
+    return items[start_idx:] + items[:start_idx]
 
 
 def _url_quote(value):
@@ -454,6 +476,30 @@ def playback_stop_requested(user_text):
     return any(phrase in text for phrase in STOP_PHRASES)
 
 
+def playback_skip_requested(user_text):
+    text = normalize_text(user_text)
+    if not text:
+        return False
+    # Stop always wins — never treat a stop phrase as a skip.
+    if playback_stop_requested(user_text):
+        return False
+    tokens = text.split()
+    # Music near the mic produces noisy transcriptions, so only short utterances
+    # count as a skip command.
+    if len(tokens) <= 4 and ("next" in tokens or "skip" in tokens):
+        return True
+    return False
+
+
+def playback_new_request(user_text):
+    text = normalize_text(user_text)
+    if not text:
+        return False
+    if playback_stop_requested(user_text) or playback_skip_requested(user_text):
+        return False
+    return bool(re.search(r"\bplay\b", text))
+
+
 def parse_devkit_payload(output_text):
     text = str(output_text or "").strip()
     if not text:
@@ -689,10 +735,17 @@ class PlexAudioPlayerCapability(MatchingCapability):
             await self.worker.session_tasks.sleep(PLAYBACK_LISTEN_WINDOW_SECONDS)
             return None
 
-    async def _devkit_playback(self, client, item, offset_ms):
-        """Play on the DevKit and wait for finish or a stop command.
-        Returns (final_position_ms, user_stopped) where user_stopped=True means the user
-        asked to stop (no more tracks), False means the track ended naturally."""
+    async def _devkit_playback(self, client, item, offset_ms, allow_switch=False):
+        """Play on the DevKit and wait for finish or a spoken command.
+
+        Returns (position_ms, action, payload):
+          "ended"       — track finished naturally, status failed 3x, or watchdog expired. payload None.
+          "stopped"     — user asked to stop; playback halted. payload None.
+          "skip"        — user said next/skip (allow_switch only); playback ducked, not stopped. payload None.
+          "new_request" — user asked to play something new (allow_switch only); music keeps
+                          playing ducked, payload is the raw heard utterance.
+
+        Detection precedence when something is heard: stop > skip > new_request > ignore."""
         data, error = await self._devkit_call(
             "plex_play",
             [
@@ -723,17 +776,25 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 status_failures = 0
                 position_ms = int(status.get("position_ms") or position_ms)
                 if not status.get("playing"):
-                    return position_ms, False
+                    return position_ms, "ended", None
             heard = await self._listen_during_playback()
-            if heard and playback_stop_requested(heard):
-                await self._devkit_call("plex_duck", ["10"], 5)
-                stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
-                if stop_data is not None:
-                    position_ms = int(stop_data.get("position_ms") or position_ms)
-                await self.capability_worker.speak("Okay, stopping Plex.")
-                return position_ms, True
+            if heard:
+                if playback_stop_requested(heard):
+                    await self._devkit_call("plex_duck", ["10"], 5)
+                    stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                    if stop_data is not None:
+                        position_ms = int(stop_data.get("position_ms") or position_ms)
+                    await self.capability_worker.speak("Okay, stopping Plex.")
+                    return position_ms, "stopped", None
+                if allow_switch and playback_skip_requested(heard):
+                    await self._devkit_call("plex_duck", ["10"], 5)
+                    await self.capability_worker.speak("Okay, next.")
+                    return position_ms, "skip", None
+                if allow_switch and playback_new_request(heard):
+                    await self._devkit_call("plex_duck", ["20"], 5)
+                    return position_ms, "new_request", heard
         await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
-        return position_ms, False
+        return position_ms, "ended", None
 
     async def _get_initial_request(self):
         try:
@@ -853,7 +914,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak(f"Resuming {describe_item(choice)} from Plex.")
                 self._write_resume_state(build_resume_state(choice, offset_ms))
                 if devkit_mode:
-                    final_position_ms, _ = await self._devkit_playback(client, choice, offset_ms)
+                    final_position_ms, _, _ = await self._devkit_playback(client, choice, offset_ms)
                     elapsed_ms = max(0, final_position_ms - offset_ms)
                 else:
                     elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
@@ -875,6 +936,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak(
                     "I could not find matching music or audiobooks in Plex. Try a title, artist, album, or book name."
                 )
+                await self._devkit_call("plex_duck", ["100"], 5)
                 return
 
             # --- Audiobook: single track with resume state ---
@@ -882,7 +944,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
                 self._write_resume_state(build_resume_state(choice, 0))
                 if devkit_mode:
-                    final_position_ms, _ = await self._devkit_playback(client, choice, 0)
+                    final_position_ms, _, _ = await self._devkit_playback(client, choice, 0)
                     elapsed_ms = max(0, final_position_ms)
                 else:
                     elapsed_ms = await self._stream_audio(client.stream_url_for(choice))
@@ -892,25 +954,47 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
             # --- Music: build a queue from all matching results, play in order ---
             # items is already sorted by relevance score (best first from _devkit_search /
-            # search_plex_audio). Start from the best match; wrap to include lower-ranked tracks.
-            try:
-                start_idx = next(i for i, it in enumerate(items) if it.part_key == choice.part_key)
-            except StopIteration:
-                start_idx = 0
-            queue = items[start_idx:] + items[:start_idx]
-
+            # search_plex_audio). Prefer the same artist, else wrap to include lower-ranked tracks.
+            queue = build_music_queue(items, choice)
+            i = 0
+            offset = 0
             await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
-            for track in queue:
-                if devkit_mode:
-                    _, user_stopped = await self._devkit_playback(client, track, 0)
-                    if user_stopped:
-                        return
-                else:
-                    await self._stream_audio(client.stream_url_for(track))
+            while i < len(queue):
+                if not devkit_mode:
+                    await self._stream_audio(client.stream_url_for(queue[i]))
                     return  # cloud path cannot detect track end, play one track only
+                position_ms, action, payload = await self._devkit_playback(
+                    client, queue[i], offset, allow_switch=True
+                )
+                if action == "stopped":
+                    return
+                if action == "skip":
+                    i += 1
+                    offset = 0
+                    continue
+                if action == "new_request":
+                    new_items = await self._devkit_search(client, payload)
+                    new_choice = choose_best_item(new_items, payload)
+                    if new_choice:
+                        await self.capability_worker.speak(f"Playing {describe_item(new_choice)} from Plex.")
+                        queue = build_music_queue(new_items, new_choice)
+                        i = 0
+                        offset = 0
+                        continue
+                    await self.capability_worker.speak("I couldn't find that. Continuing the music.")
+                    offset = position_ms  # resume current track where it was
+                    continue  # same i — plex_play restarts the track at offset, full volume
+                # action == "ended"
+                i += 1
+                offset = 0
+
+            # Queue exhausted. If the last action was a skip, mpv is still playing ducked — stop it.
+            await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
 
         except Exception as exc:
             self.worker.editor_logging_handler.error(f"[PlexAudio] Error: {exc}")
             await self.capability_worker.speak(plex_error_message(base_url, exc, devkit_mode))
+            # If we ducked in-progress music but never started new playback, restore its volume.
+            await self._devkit_call("plex_duck", ["100"], 5)
         finally:
             self.capability_worker.resume_normal_flow()
