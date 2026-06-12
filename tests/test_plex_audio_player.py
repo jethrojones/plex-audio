@@ -801,3 +801,112 @@ def test_choose_best_item_accepts_3_doors_down_track():
     choice = mod.choose_best_item(items, "play 3 doors down")
     assert choice is not None
     assert choice.part_key == "/3dd.mp3"
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Plex account linking (PIN OAuth flow) — pure helpers
+# ---------------------------------------------------------------------------
+
+def test_link_requested_detects_account_link_phrases():
+    mod = load_ability_module()
+
+    assert mod.link_requested("link my plex account")
+    assert mod.link_requested("sign in to plex")
+    assert mod.link_requested("log in to plex")
+    assert mod.link_requested("connect plex")
+    assert mod.link_requested("authorize plex")
+
+
+def test_link_requested_ignores_ordinary_play_requests():
+    mod = load_ability_module()
+
+    assert not mod.link_requested("play metallica from plex")
+    assert not mod.link_requested("play music")
+    # "link" without "plex" must not fire.
+    assert not mod.link_requested("link my spotify account")
+    # "plex" alone without an account/auth verb must not fire.
+    assert not mod.link_requested("play the audiobook Dune from plex")
+
+
+def test_parse_pin_response_extracts_id_and_code():
+    mod = load_ability_module()
+
+    # Field names observed live at plex.tv/api/v2/pins: integer "id", string "code".
+    pin_id, code = mod.parse_pin_response({"id": 1747085891, "code": "z0d0isvxc4glwo1", "authToken": None})
+
+    assert pin_id == 1747085891
+    assert code == "z0d0isvxc4glwo1"
+
+
+def test_parse_pin_response_returns_none_on_missing_fields():
+    mod = load_ability_module()
+
+    assert mod.parse_pin_response({}) == (None, None)
+    assert mod.parse_pin_response({"id": 5}) == (None, None)
+    assert mod.parse_pin_response({"code": "abcd"}) == (None, None)
+    assert mod.parse_pin_response(None) == (None, None)
+
+
+def test_parse_pin_poll_returns_token_when_claimed():
+    mod = load_ability_module()
+
+    assert mod.parse_pin_poll({"authToken": "secret-account-token"}) == "secret-account-token"
+
+
+def test_parse_pin_poll_returns_none_when_authtoken_null():
+    mod = load_ability_module()
+
+    # An unclaimed PIN reports authToken: null (confirmed against the live endpoint).
+    assert mod.parse_pin_poll({"authToken": None}) is None
+    assert mod.parse_pin_poll({}) is None
+    assert mod.parse_pin_poll(None) is None
+
+
+def test_spell_out_code_renders_discrete_characters():
+    mod = load_ability_module()
+
+    assert mod.spell_out_code("ABC7") == "A. B. C. 7."
+    assert mod.spell_out_code("") == ""
+
+
+# ---------------------------------------------------------------------------
+# Task 3: remote-access fallback — choose_best_plex_connection(prefer_remote=True)
+# ---------------------------------------------------------------------------
+
+def test_choose_best_connection_prefer_remote_picks_non_local_candidate():
+    mod = load_ability_module()
+    connections = [
+        {"base_url": "http://192.168.0.20:32400", "local": True, "token": "tok"},
+        {"base_url": "http://10.0.0.136:32400", "local": True, "token": "tok"},
+        {"base_url": "https://76-121-135-187.example.plex.direct:32400", "local": False, "token": "tok"},
+    ]
+
+    chosen = mod.choose_best_plex_connection(connections, prefer_remote=True)
+
+    assert chosen["base_url"] == "https://76-121-135-187.example.plex.direct:32400"
+
+
+def test_choose_best_connection_prefer_remote_returns_none_when_only_local():
+    mod = load_ability_module()
+    connections = [
+        {"base_url": "http://192.168.0.20:32400", "local": True, "token": "tok"},
+        {"base_url": "http://10.0.0.136:32400", "local": True, "token": "tok"},
+    ]
+
+    assert mod.choose_best_plex_connection(connections, prefer_remote=True) is None
+
+
+def test_choose_best_connection_default_behavior_unchanged_when_prefer_remote_false():
+    mod = load_ability_module()
+    connections = [
+        {"base_url": "http://192.168.0.20:32400", "local": True, "token": "tok"},
+        {"base_url": "http://10.0.0.136:32400", "local": True, "token": "tok"},
+        {"base_url": "https://76-121-135-187.example.plex.direct:32400", "local": False, "token": "tok"},
+    ]
+
+    # With prefer_remote False (default), the preferred-subnet rule still wins.
+    chosen = mod.choose_best_plex_connection(connections, preferred_subnets=["10."])
+    assert chosen["base_url"] == "http://10.0.0.136:32400"
+    # And with no preferred subnets, it picks the first local candidate as before.
+    chosen_local = mod.choose_best_plex_connection(connections)
+    assert chosen_local["base_url"] == "http://192.168.0.20:32400"

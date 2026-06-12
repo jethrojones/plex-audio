@@ -15,6 +15,8 @@ PLEX_TOKEN_KEY = "plex_token"
 PLEX_ACCOUNT_TOKEN_KEY = "plex_account_token"
 PLEX_SERVER_NAME_KEY = "plex_server_name"
 PLEX_MACHINE_IDENTIFIER_KEY = "plex_machine_identifier"
+PLEX_CLIENT_ID = "openhome-plexaudio-cloud"
+PLEX_LINK_STATE_KEY = "plex_audio_account_link"
 REQUEST_TIMEOUT = 15
 STREAM_CHUNK_SIZE = 64 * 1024
 AUDIO_SEARCH_TYPE = "10"
@@ -332,9 +334,15 @@ def _connection_matches(connection, server_name=None, machine_identifier=None):
     return True
 
 
-def choose_best_plex_connection(connections, preferred_subnets=None):
+def choose_best_plex_connection(connections, preferred_subnets=None, prefer_remote=False):
     candidates = [conn for conn in connections if conn and conn.get("base_url")]
     if not candidates:
+        return None
+    if prefer_remote:
+        # Pick a genuinely remote endpoint: not flagged local and not a private address.
+        for conn in candidates:
+            if not conn.get("local") and not _url_is_local(conn.get("base_url")):
+                return conn
         return None
     prefixes = [str(prefix) for prefix in (preferred_subnets or []) if prefix]
     for prefix in prefixes:
@@ -347,7 +355,7 @@ def choose_best_plex_connection(connections, preferred_subnets=None):
     return candidates[0]
 
 
-def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None, preferred_subnets=None):
+def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None, preferred_subnets=None, prefer_remote=False):
     if not xml_text:
         return None
     root = ET.fromstring(xml_text)
@@ -373,10 +381,10 @@ def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None,
                     "local": local_flag,
                 }
             )
-    return choose_best_plex_connection(connections, preferred_subnets)
+    return choose_best_plex_connection(connections, preferred_subnets, prefer_remote)
 
 
-def discover_plex_tv_resource(account_token, server_name=None, machine_identifier=None, preferred_subnets=None, logger=None):
+def discover_plex_tv_resource(account_token, server_name=None, machine_identifier=None, preferred_subnets=None, logger=None, prefer_remote=False):
     token = str(account_token or "").strip()
     if not token:
         return None
@@ -384,7 +392,7 @@ def discover_plex_tv_resource(account_token, server_name=None, machine_identifie
         url = "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&X-Plex-Token=" + _url_quote(token)
         response = requests.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return parse_plex_tv_resources(response.text, server_name, machine_identifier, preferred_subnets)
+        return parse_plex_tv_resources(response.text, server_name, machine_identifier, preferred_subnets, prefer_remote)
     except Exception as exc:
         if logger:
             logger.warning(f"[PlexAudio] Plex.tv resource discovery failed: {exc}")
@@ -625,6 +633,47 @@ def PlexAudioClient(base_url, token, logger=None):
 def exit_requested(user_text):
     text = normalize_text(user_text)
     return text in EXIT_WORDS or any(text == normalize_text(word) for word in EXIT_WORDS)
+
+
+def link_requested(user_text):
+    """True when the user is asking to link/connect their Plex account.
+
+    Requires the word "plex" plus an explicit account/auth verb so ordinary
+    play requests ("play metallica from plex") never trigger linking."""
+    text = normalize_text(user_text)
+    if "plex" not in text:
+        return False
+    link_terms = [
+        "link", "sign in", "log in", "login", "connect",
+        "authenticate", "authorize", "account",
+    ]
+    return any(term in text for term in link_terms)
+
+
+def parse_pin_response(json_dict):
+    """Extract (pin_id, code) from a Plex create-pin response, or (None, None)."""
+    if not isinstance(json_dict, dict):
+        return None, None
+    pin_id = json_dict.get("id")
+    code = json_dict.get("code")
+    if pin_id is None or not code:
+        return None, None
+    return pin_id, str(code)
+
+
+def parse_pin_poll(json_dict):
+    """Return the authToken from a Plex poll response, or None when unclaimed."""
+    if not isinstance(json_dict, dict):
+        return None
+    token = json_dict.get("authToken")
+    if not token:
+        return None
+    return str(token)
+
+
+def spell_out_code(code):
+    """Render a link code as discrete TTS-friendly characters: 'A. B. C. 7.'."""
+    return " ".join(f"{char}." for char in str(code or "").strip())
 
 
 NEGATION_WORDS = {
@@ -869,6 +918,15 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
     def _resolve_client(self, base_url, token, account_token, server_name, machine_identifier):
         logger = self.worker.editor_logging_handler
+        # Fall back to the stored account-link token when config has no token.
+        # A Plex account auth token works as both a server token (direct auth)
+        # and an account token (plex.tv resource discovery).
+        link_token = self._linked_token()
+        if not token and link_token:
+            token = link_token
+        if not account_token and link_token:
+            account_token = link_token
+
         if base_url:
             return PlexAudioClient(base_url, token, logger)
 
@@ -973,6 +1031,23 @@ class PlexAudioPlayerCapability(MatchingCapability):
         position_ms = int(offset_ms or 0)
         status_failures = 0
         while time.monotonic() - started < MAX_PLAYBACK_SECONDS:
+            # Platform-driven stop/pause: the runtime sets these events when the
+            # user asks to stop or pause during music mode. Same device action
+            # here (mpv is killed); callers persist audiobook positions.
+            if hasattr(self.worker, "music_mode_stop_event") and self.worker.music_mode_stop_event.is_set():
+                await self._devkit_call("plex_duck", ["10"], 5)
+                stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                if stop_data is not None:
+                    position_ms = int(stop_data.get("position_ms") or position_ms)
+                await self.capability_worker.speak("Okay, stopping Plex.")
+                return position_ms, "stopped", None
+            if hasattr(self.worker, "music_mode_pause_event") and self.worker.music_mode_pause_event.is_set():
+                await self._devkit_call("plex_duck", ["10"], 5)
+                stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                if stop_data is not None:
+                    position_ms = int(stop_data.get("position_ms") or position_ms)
+                await self.capability_worker.speak("Okay, pausing Plex.")
+                return position_ms, "stopped", None
             status, status_error = await self._devkit_call("plex_status", [], DEVKIT_CONTROL_TIMEOUT)
             if status is None:
                 status_failures += 1
@@ -1022,6 +1097,8 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
     async def _stream_audio(self, stream_url):
         started_at = time.monotonic()
+        if hasattr(self.worker, "music_mode_event"):
+            self.worker.music_mode_event.set()
         try:
             await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "on"})
         except Exception as exc:
@@ -1044,6 +1121,8 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "off"})
             except Exception as exc:
                 self.worker.editor_logging_handler.warning(f"[PlexAudio] Music mode cleanup failed: {exc}")
+            if hasattr(self.worker, "music_mode_event"):
+                self.worker.music_mode_event.clear()
 
     def _read_resume_state(self):
         try:
@@ -1063,6 +1142,122 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 self.capability_worker.create_key(RESUME_STATE_KEY, state)
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Resume save failed: {exc}")
+
+    def _read_link_state(self):
+        try:
+            return self.capability_worker.get_single_key(PLEX_LINK_STATE_KEY)
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Link read failed: {exc}")
+            return None
+
+    def _write_link_state(self, state):
+        if not state:
+            return
+        try:
+            existing = self.capability_worker.get_single_key(PLEX_LINK_STATE_KEY)
+            if existing:
+                self.capability_worker.update_key(PLEX_LINK_STATE_KEY, state)
+            else:
+                self.capability_worker.create_key(PLEX_LINK_STATE_KEY, state)
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Link save failed: {exc}")
+
+    def _linked_token(self):
+        state = self._read_link_state()
+        if isinstance(state, dict):
+            return str(state.get("token") or "").strip()
+        return ""
+
+    def _plex_link_headers(self):
+        return {
+            "Accept": "application/json",
+            "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
+            "X-Plex-Product": "OpenHome PlexAudio",
+        }
+
+    async def _music_mode_on(self):
+        """Signal the platform that immersive music playback is starting."""
+        if hasattr(self.worker, "music_mode_event"):
+            self.worker.music_mode_event.set()
+        try:
+            await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "on"})
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Music mode signal failed: {exc}")
+
+    async def _music_mode_off(self):
+        """Tear down music mode. Safe to call even if it was never turned on."""
+        try:
+            await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "off"})
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Music mode cleanup failed: {exc}")
+        if hasattr(self.worker, "music_mode_event"):
+            self.worker.music_mode_event.clear()
+        if hasattr(self.worker, "music_mode_stop_event"):
+            self.worker.music_mode_stop_event.clear()
+        if hasattr(self.worker, "music_mode_pause_event"):
+            self.worker.music_mode_pause_event.clear()
+
+    async def _link_plex_account(self):
+        """Run the Plex PIN device-link flow and store the resulting account token."""
+        logger = self.worker.editor_logging_handler
+        headers = self._plex_link_headers()
+        try:
+            # Non-strong PINs yield the short 4-character code that plex.tv/link
+            # accepts for manual entry; strong=true returns a long token instead.
+            response = requests.post(
+                "https://plex.tv/api/v2/pins",
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            pin_id, code = parse_pin_response(response.json())
+        except Exception as exc:
+            logger.warning(f"[PlexAudio] Plex PIN creation failed: {exc}")
+            await self.capability_worker.speak(
+                "I couldn't start the Plex sign-in right now. Please try again in a moment."
+            )
+            return
+
+        if not pin_id or not code:
+            await self.capability_worker.speak(
+                "I couldn't start the Plex sign-in right now. Please try again in a moment."
+            )
+            return
+
+        spelled = spell_out_code(code)
+        await self.capability_worker.speak(
+            "To link your Plex account, open plex dot tv slash link on your phone or computer, "
+            f"and enter the code: {spelled} ... I'll wait while you enter it."
+        )
+
+        poll_url = f"https://plex.tv/api/v2/pins/{pin_id}"
+        # Poll every 5 seconds for up to 4 minutes (48 attempts), with one
+        # reminder near the 2-minute mark.
+        max_attempts = 48
+        reminder_at = 24  # ~2 minutes in
+        for attempt in range(max_attempts):
+            await self.worker.session_tasks.sleep(5)
+            if attempt == reminder_at:
+                await self.capability_worker.speak(
+                    f"Still waiting. Enter this code at plex dot tv slash link: {spelled}"
+                )
+            try:
+                poll = requests.get(poll_url, headers=headers, timeout=REQUEST_TIMEOUT)
+                poll.raise_for_status()
+                auth_token = parse_pin_poll(poll.json())
+            except Exception as exc:
+                logger.warning(f"[PlexAudio] Plex PIN poll failed: {exc}")
+                continue
+            if auth_token:
+                self._write_link_state({"token": auth_token, "linked_at": time.time()})
+                await self.capability_worker.speak(
+                    "Your Plex account is linked. You can now ask me to play music or audiobooks."
+                )
+                return
+
+        await self.capability_worker.speak(
+            "That code expired before it was entered. Say \"link my Plex account\" to try again."
+        )
 
     async def run(self):
         base_url = ""
@@ -1088,12 +1283,37 @@ class PlexAudioPlayerCapability(MatchingCapability):
             devkit_info = await self._devkit_diagnose(client.base_url, client.token)
             if devkit_info is None:
                 if _url_is_local(client.base_url):
-                    await self.capability_worker.speak(
-                        "I could not connect to the OpenHome device to reach your Plex server. "
-                        "Make sure the device is powered on and the Plex Audio ability is synced to it, then try again."
-                    )
-                    return
-                devkit_mode = False
+                    # The DevKit is down and the only known Plex address is on the
+                    # LAN, which the cloud runtime cannot reach. Before giving up,
+                    # try Plex.tv resource discovery for a remote-access endpoint.
+                    remote_token = account_token or self._linked_token()
+                    remote_connection = discover_plex_tv_resource(
+                        remote_token,
+                        server_name=server_name,
+                        machine_identifier=machine_identifier,
+                        preferred_subnets=None,
+                        logger=self.worker.editor_logging_handler,
+                        prefer_remote=True,
+                    ) if remote_token else None
+                    if remote_connection and remote_connection.get("base_url"):
+                        client = PlexAudioClient(
+                            remote_connection.get("base_url"),
+                            remote_connection.get("token") or client.token,
+                            self.worker.editor_logging_handler,
+                        )
+                        base_url = client.base_url
+                        devkit_mode = False
+                        await self.capability_worker.speak(
+                            "Your OpenHome device is not reachable, so I'll stream from Plex remote access instead."
+                        )
+                    else:
+                        await self.capability_worker.speak(
+                            "I could not connect to the OpenHome device to reach your Plex server. "
+                            "Make sure the device is powered on and the Plex Audio ability is synced to it, then try again."
+                        )
+                        return
+                else:
+                    devkit_mode = False
             elif not devkit_info.get("plex_reachable"):
                 await self.capability_worker.speak(
                     "Your OpenHome device is online, but it cannot reach the Plex server at the configured address. "
@@ -1112,6 +1332,10 @@ class PlexAudioPlayerCapability(MatchingCapability):
             user_request = await self._get_initial_request()
             if not user_request or exit_requested(user_request):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")
+                return
+
+            if link_requested(user_request):
+                await self._link_plex_account()
                 return
 
             # STT sometimes finalizes early, leaving only a wake/command artifact
@@ -1143,6 +1367,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak(f"Resuming {describe_item(choice)} from Plex.")
                 self._write_resume_state(build_resume_state(choice, offset_ms))
                 if devkit_mode:
+                    await self._music_mode_on()
                     final_position_ms, _, _ = await self._devkit_playback(client, choice, offset_ms)
                     elapsed_ms = max(0, final_position_ms - offset_ms)
                 else:
@@ -1173,6 +1398,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
                 self._write_resume_state(build_resume_state(choice, 0))
                 if devkit_mode:
+                    await self._music_mode_on()
                     final_position_ms, _, _ = await self._devkit_playback(client, choice, 0)
                     elapsed_ms = max(0, final_position_ms)
                 else:
@@ -1188,6 +1414,8 @@ class PlexAudioPlayerCapability(MatchingCapability):
             i = 0
             offset = 0
             await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
+            if devkit_mode:
+                await self._music_mode_on()
             while i < len(queue):
                 if not devkit_mode:
                     await self._stream_audio(client.stream_url_for(queue[i]))
@@ -1226,4 +1454,5 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # If we ducked in-progress music but never started new playback, restore its volume.
             await self._devkit_call("plex_duck", ["100"], 5)
         finally:
+            await self._music_mode_off()
             self.capability_worker.resume_normal_flow()
