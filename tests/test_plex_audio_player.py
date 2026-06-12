@@ -582,6 +582,138 @@ def test_playback_new_request_detects_play_mid_playback():
     assert not mod.playback_new_request("")
 
 
+def test_choose_best_item_picks_artist_over_garbled_wakeword_title():
+    """Garbled wake word 'I'll put home' must not outrank the requested artist."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("I’ll Be Home for Christmas", "Bing Crosby", "Holiday", "music", "/xmas.mp3", 180000, "x1"),
+        mod.PlexAudioItem("Enter Sandman", "Metallica", "Metallica", "music", "/sandman.mp3", 330000, "m1"),
+    ]
+
+    choice = mod.choose_best_item(items, "I'll put home Play Metallica from Plex.")
+
+    assert choice.part_key == "/sandman.mp3"
+
+
+def test_choose_best_item_returns_none_for_meaningful_query_with_only_junk():
+    """A meaningful query that matches nothing should play nothing, not junk."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Twinkle Twinkle", "Kids Choir", "Nursery", "music", "/a.mp3", 60000, "a"),
+        mod.PlexAudioItem("ABC Song", "Kids Choir", "Nursery", "music", "/b.mp3", 60000, "b"),
+    ]
+
+    assert mod.choose_best_item(items, "play metallica") is None
+
+
+def test_choose_best_item_still_plays_for_generic_request():
+    """Generic 'play music' (empty meaningful query) still plays a zero-score item."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Twinkle Twinkle", "Kids Choir", "Nursery", "music", "/a.mp3", 60000, "a"),
+        mod.PlexAudioItem("ABC Song", "Kids Choir", "Nursery", "music", "/b.mp3", 60000, "b"),
+    ]
+
+    choice = mod.choose_best_item(items, "play music")
+
+    assert choice is not None
+    assert choice.part_key in {"/a.mp3", "/b.mp3"}
+
+
+def test_candidate_artist_phrases_drops_stopwords_and_orders_longest_first():
+    mod = load_ability_module()
+
+    phrases = mod.candidate_artist_phrases("I'll put home Play Metallica from Plex.")
+
+    assert "metallica" in phrases
+    # Only "metallica" survives stopword filtering (i, ll, put, home, play, from, plex).
+    assert phrases == ["metallica"]
+
+    # Multi-token artist keeps longest-first ordering with single stopwords gone.
+    multi = mod.candidate_artist_phrases("play 3 doors down from plex")
+    assert multi[0] == "3 doors down"
+    assert multi.index("3 doors down") < multi.index("doors")
+    assert "from" not in multi and "plex" not in multi
+
+
+def test_candidate_artist_phrases_matches_devkit_implementation():
+    mod = load_ability_module()
+    dev = load_devkit_module()
+
+    text = "I'll put home Play Metallica from Plex."
+    assert mod.candidate_artist_phrases(text) == dev.candidate_artist_phrases(text)
+
+
+def test_playback_stop_and_skip_respect_negation():
+    mod = load_ability_module()
+
+    # Negated stop must not stop.
+    assert mod.playback_stop_requested("please don't stop the music") is False
+    # Plain stop command must stop, even at 6 tokens.
+    assert mod.playback_stop_requested("stop the music right now please") is True
+    # Negated skip must not skip.
+    assert mod.playback_skip_requested("don't skip this one") is False
+
+
+def test_devkit_score_item_weights_creator_above_title():
+    dev = load_devkit_module()
+    by_artist = {
+        "title": "Some Song",
+        "creator": "Metallica",
+        "collection": "Album",
+        "media_type": "music",
+        "part_key": "/a.mp3",
+        "duration_ms": 1,
+        "rating_key": "a",
+    }
+    by_title = {
+        "title": "Metallica Tribute",
+        "creator": "Cover Band",
+        "collection": "Album",
+        "media_type": "music",
+        "part_key": "/b.mp3",
+        "duration_ms": 1,
+        "rating_key": "b",
+    }
+
+    assert dev.score_item(by_artist, "play metallica") > dev.score_item(by_title, "play metallica")
+
+
+def test_devkit_search_artist_first_returns_only_that_artist():
+    """An artist hit should return the artist's tracks, skipping generic search."""
+    dev = load_devkit_module()
+    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
+    artist_dir_xml = (
+        '<MediaContainer>'
+        '<Directory ratingKey="20495" type="artist" title="Metallica" />'
+        '</MediaContainer>'
+    )
+    artist_tracks_xml = """
+    <MediaContainer>
+      <Track title="Enter Sandman" grandparentTitle="Metallica" parentTitle="Metallica" ratingKey="s1">
+        <Media duration="330000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="One" grandparentTitle="Metallica" parentTitle="...And Justice" ratingKey="s2">
+        <Media duration="446000"><Part key="/library/parts/2/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    def fake_get(url, timeout=None):
+        if "type=8" in url and "title=metallica" in url:
+            return artist_dir_xml
+        if "artist.id=20495" in url:
+            return artist_tracks_xml
+        if "/library/sections/6/all" in url:
+            return "<MediaContainer />"  # generic path would return nothing
+        return sections_xml
+
+    items = dev.search_plex_audio("http://10.0.0.136:32400", "", "play metallica", get_text=fake_get)
+
+    assert {item["creator"] for item in items} == {"Metallica"}
+    assert {item["title"] for item in items} == {"Enter Sandman", "One"}
+
+
 def test_build_music_queue_prefers_same_artist_then_falls_back_to_wraparound():
     mod = load_ability_module()
     choice = mod.PlexAudioItem("Enter Sandman", "Metallica", "Metallica", "music", "/m1.mp3", 330000, "m1")
@@ -598,3 +730,74 @@ def test_build_music_queue_prefers_same_artist_then_falls_back_to_wraparound():
     single_items = [unrelated, choice]
     single_queue = mod.build_music_queue(single_items, choice)
     assert [it.part_key for it in single_queue] == ["/m1.mp3", "/jz.mp3"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: artist_matches_query — strict artist acceptance
+# ---------------------------------------------------------------------------
+
+def test_artist_matches_query_rejects_partial_token_overlap():
+    """'James Taylor' must NOT match 'Play Taylor Swift' — 'james' is missing."""
+    mod = load_ability_module()
+    assert mod.artist_matches_query("James Taylor", "Play Taylor Swift") is False
+
+
+def test_artist_matches_query_accepts_exact_single_token():
+    """'Metallica' — every meaningful token ('metallica') is in the query."""
+    mod = load_ability_module()
+    assert mod.artist_matches_query("Metallica", "I'll put home Play Metallica from Plex.") is True
+
+
+def test_artist_matches_query_accepts_stopword_artist_after_stripping():
+    """'The Beatles' — stopword 'the' is stripped, leaving ['beatles'] which is in the query."""
+    mod = load_ability_module()
+    assert mod.artist_matches_query("The Beatles", "play the beatles") is True
+
+
+def test_artist_matches_query_accepts_multi_token_artist():
+    """'3 Doors Down' — tokens ['3','doors','down'] all appear in 'play 3 doors down'."""
+    mod = load_ability_module()
+    assert mod.artist_matches_query("3 Doors Down", "play 3 doors down") is True
+
+
+def test_artist_matches_query_parity_main_devkit():
+    """main.py and devkit_functions.py implementations must behave identically."""
+    mod = load_ability_module()
+    dev = load_devkit_module()
+
+    cases = [
+        ("James Taylor", "Play Taylor Swift"),
+        ("Metallica", "I'll put home Play Metallica from Plex."),
+        ("The Beatles", "play the beatles"),
+        ("3 Doors Down", "play 3 doors down"),
+    ]
+    for artist, query in cases:
+        assert mod.artist_matches_query(artist, query) == dev.artist_matches_query(artist, query), (
+            f"Parity failure for artist_matches_query({artist!r}, {query!r})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: choose_best_item token-coverage guard
+# ---------------------------------------------------------------------------
+
+def test_choose_best_item_rejects_james_taylor_for_taylor_swift_query():
+    """'Play Taylor Swift': 'taylor' matches but 'swift' does not — coverage fails (1 of 2)."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Fire and Rain", "James Taylor", "Sweet Baby James", "music", "/jt.mp3", 200000, "jt1"),
+        mod.PlexAudioItem("Carolina in My Mind", "James Taylor", "James Taylor", "music", "/jt2.mp3", 210000, "jt2"),
+    ]
+    assert mod.choose_best_item(items, "Play Taylor Swift") is None
+
+
+def test_choose_best_item_accepts_3_doors_down_track():
+    """'play 3 doors down': meaningful tokens are {3, doors, down} (3 tokens).
+    A track by '3 Doors Down' matches all 3 → 3 > 1.5 → passes coverage."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Kryptonite", "3 Doors Down", "The Better Life", "music", "/3dd.mp3", 220000, "3dd1"),
+    ]
+    choice = mod.choose_best_item(items, "play 3 doors down")
+    assert choice is not None
+    assert choice.part_key == "/3dd.mp3"

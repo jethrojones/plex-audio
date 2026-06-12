@@ -71,8 +71,53 @@ _SANITIZE_PATTERNS = [
 ]
 
 
+STOPWORDS = {
+    "i", "ll", "im", "ive", "id", "a", "an", "the", "to", "of", "for", "and",
+    "or", "me", "my", "we", "you", "it", "is", "on", "in", "at", "from", "some",
+    "please", "play", "plex", "music", "song", "track", "album", "artist",
+    "library", "put", "open", "home", "openhome", "oh", "hey", "like", "want",
+    "hear", "listen", "audiobook", "book",
+}
+
+
 def normalize_text(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def artist_matches_query(artist_title, user_text):
+    """An artist hit requires every meaningful token of the artist's name to
+    appear in the user's words — 'James Taylor' must not match 'play taylor swift'."""
+    artist_tokens = [t for t in normalize_text(artist_title).split() if t not in STOPWORDS]
+    query_tokens = set(normalize_text(user_text).split())
+    return bool(artist_tokens) and all(t in query_tokens for t in artist_tokens)
+
+
+def candidate_artist_phrases(user_text, max_attempts=10):
+    """Generate candidate artist-name phrases from a user utterance.
+
+    Tokenizes the normalized text, drops stopwords, then returns contiguous
+    n-grams ordered longest-first (the full remaining phrase down to single
+    tokens). Single tokens shorter than 3 chars are skipped unless numeric.
+    Capped at max_attempts lookup attempts.
+    """
+    tokens = [t for t in normalize_text(user_text).split() if t and t not in STOPWORDS]
+    phrases = []
+    seen = set()
+    n = len(tokens)
+    for size in range(n, 0, -1):
+        for start in range(0, n - size + 1):
+            gram_tokens = tokens[start:start + size]
+            if size == 1:
+                token = gram_tokens[0]
+                if len(token) < 3 and not token.isdigit():
+                    continue
+            phrase = " ".join(gram_tokens)
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                phrases.append(phrase)
+                if len(phrases) >= max_attempts:
+                    return phrases
+    return phrases
 
 
 def _meaningful_query(user_text):
@@ -119,10 +164,15 @@ def score_item(item, user_text, requested_type=None):
         score += 100
     if query and query in item_text:
         score += 50
-    query_tokens = query.split()
-    item_tokens = item_text.split()
+    query_tokens = [t for t in query.split() if t and t not in STOPWORDS]
+    title_collection_tokens = set(
+        normalize_text(" ".join([item["title"], item["collection"]])).split()
+    )
+    creator_tokens = set(normalize_text(item["creator"]).split())
     for token in query_tokens:
-        if token and token in item_tokens:
+        if token in creator_tokens:
+            score += 40
+        elif token in title_collection_tokens:
             score += 10
     title_text = normalize_text(item["title"])
     if title_text and title_text in query:
@@ -194,6 +244,73 @@ def _parse_tracks(xml_text):
     return items
 
 
+def _parse_artist_directories(xml_text):
+    """Parse <Directory type="artist"> elements into (rating_key, title) tuples."""
+    if not xml_text:
+        return []
+    root = ET.fromstring(xml_text)
+    artists = []
+    for directory in root.findall(".//Directory"):
+        if directory.attrib.get("type", "") != "artist":
+            continue
+        rating_key = directory.attrib.get("ratingKey") or ""
+        title = directory.attrib.get("title") or ""
+        if rating_key and title:
+            artists.append((rating_key, title))
+    return artists
+
+
+def _artist_first_candidates(base_url, token, user_text, audio_sections, get_text):
+    """Try to resolve the query to an artist and return that artist's tracks.
+
+    Returns a list of track dicts on an artist hit, or None when no artist
+    matched (so the caller falls back to the generic search path).
+    """
+    phrases = candidate_artist_phrases(user_text)
+    if not phrases:
+        return None
+    for section_key, section_title, section_type in audio_sections:
+        if not section_key:
+            continue
+        path = "/library/sections/%s/all" % section_key
+        for phrase in phrases:
+            try:
+                artists = _parse_artist_directories(
+                    get_text(plex_url(base_url, path, token, {"type": "8", "title": phrase}))
+                )
+            except Exception as exc:
+                log.warning("[PlexAudio] Artist lookup failed for %r: %s", phrase, exc)
+                continue
+            # Keep only artists whose every meaningful token appears in user_text.
+            accepted = [
+                (rating_key, artist_title)
+                for rating_key, artist_title in artists
+                if artist_matches_query(artist_title, user_text)
+            ]
+            if not accepted:
+                continue
+            # Prefer the most specific artist (most non-stopword tokens); tie-break on title length.
+            accepted.sort(
+                key=lambda rk_t: (
+                    len([t for t in normalize_text(rk_t[1]).split() if t not in STOPWORDS]),
+                    len(rk_t[1]),
+                ),
+                reverse=True,
+            )
+            for rating_key, artist_title in accepted:
+                try:
+                    tracks = _parse_tracks(
+                        get_text(plex_url(base_url, path, token, {"type": AUDIO_SEARCH_TYPE, "artist.id": rating_key}))
+                    )
+                except Exception as exc:
+                    log.warning("[PlexAudio] Artist track lookup failed for %r: %s", artist_title, exc)
+                    continue
+                if tracks:
+                    log.info("[PlexAudio] Artist-first hit %r -> %d tracks", artist_title, len(tracks))
+                    return tracks
+    return None
+
+
 def search_plex_audio(base_url, token, user_text, get_text=_http_get_text):
     query = sanitize_search_query(user_text)
     # When noise words are all that remain (e.g. "play music"), treat as browse-all.
@@ -201,12 +318,7 @@ def search_plex_audio(base_url, token, user_text, get_text=_http_get_text):
     requested_type = detect_requested_media_type(user_text)
     candidates = []
 
-    if meaningful:
-        try:
-            candidates.extend(_parse_tracks(get_text(plex_url(base_url, "/search", token, {"query": query}))))
-        except Exception as exc:
-            log.warning("[PlexAudio] Global search failed: %s", exc)
-
+    audio_sections = []
     try:
         sections_xml = get_text(plex_url(base_url, "/library/sections", token))
         root = ET.fromstring(sections_xml)
@@ -216,6 +328,31 @@ def search_plex_audio(base_url, token, user_text, get_text=_http_get_text):
             if d.attrib.get("type", "") in {"artist", "music"}
         ]
         log.info("[PlexAudio] Audio sections found: %s", audio_sections)
+    except Exception as exc:
+        log.warning("[PlexAudio] Section discovery failed: %s", exc)
+
+    # Artist-first: resolve the meaningful query to an artist and use their
+    # tracks as the candidate pool, skipping the generic search entirely.
+    if meaningful:
+        artist_tracks = _artist_first_candidates(base_url, token, user_text, audio_sections, get_text)
+        if artist_tracks:
+            deduped = []
+            seen = set()
+            for item in artist_tracks:
+                key = item["part_key"] or "|".join([item["title"], item["creator"], item["collection"]])
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(item)
+            deduped.sort(key=lambda item: score_item(item, user_text, requested_type), reverse=True)
+            return deduped[:MAX_SEARCH_RESULTS]
+
+    if meaningful:
+        try:
+            candidates.extend(_parse_tracks(get_text(plex_url(base_url, "/search", token, {"query": query}))))
+        except Exception as exc:
+            log.warning("[PlexAudio] Global search failed: %s", exc)
+
+    try:
         for section_key, section_title, section_type in audio_sections:
             if not section_key:
                 continue

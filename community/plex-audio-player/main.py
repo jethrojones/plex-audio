@@ -18,6 +18,7 @@ PLEX_MACHINE_IDENTIFIER_KEY = "plex_machine_identifier"
 REQUEST_TIMEOUT = 15
 STREAM_CHUNK_SIZE = 64 * 1024
 AUDIO_SEARCH_TYPE = "10"
+MAX_SEARCH_RESULTS = 30
 RESUME_STATE_KEY = "plex_audio_last_audiobook"
 RESUME_END_THRESHOLD_MS = 60 * 1000
 EXIT_WORDS = {"stop", "exit", "quit", "cancel", "nevermind", "never mind", "done", "bye"}
@@ -77,8 +78,53 @@ _SANITIZE_PATTERNS = [
 ]
 
 
+STOPWORDS = {
+    "i", "ll", "im", "ive", "id", "a", "an", "the", "to", "of", "for", "and",
+    "or", "me", "my", "we", "you", "it", "is", "on", "in", "at", "from", "some",
+    "please", "play", "plex", "music", "song", "track", "album", "artist",
+    "library", "put", "open", "home", "openhome", "oh", "hey", "like", "want",
+    "hear", "listen", "audiobook", "book",
+}
+
+
 def normalize_text(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def artist_matches_query(artist_title, user_text):
+    """An artist hit requires every meaningful token of the artist's name to
+    appear in the user's words — 'James Taylor' must not match 'play taylor swift'."""
+    artist_tokens = [t for t in normalize_text(artist_title).split() if t not in STOPWORDS]
+    query_tokens = set(normalize_text(user_text).split())
+    return bool(artist_tokens) and all(t in query_tokens for t in artist_tokens)
+
+
+def candidate_artist_phrases(user_text, max_attempts=10):
+    """Generate candidate artist-name phrases from a user utterance.
+
+    Tokenizes the normalized text, drops stopwords, then returns contiguous
+    n-grams ordered longest-first (the full remaining phrase down to single
+    tokens). Single tokens shorter than 3 chars are skipped unless numeric.
+    Capped at max_attempts lookup attempts.
+    """
+    tokens = [t for t in normalize_text(user_text).split() if t and t not in STOPWORDS]
+    phrases = []
+    seen = set()
+    n = len(tokens)
+    for size in range(n, 0, -1):
+        for start in range(0, n - size + 1):
+            gram_tokens = tokens[start:start + size]
+            if size == 1:
+                token = gram_tokens[0]
+                if len(token) < 3 and not token.isdigit():
+                    continue
+            phrase = " ".join(gram_tokens)
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                phrases.append(phrase)
+                if len(phrases) >= max_attempts:
+                    return phrases
+    return phrases
 
 
 def detect_requested_media_type(user_text):
@@ -142,10 +188,15 @@ def score_item(item, user_text, requested_type=None):
         score += 100
     if query and query in item_text:
         score += 50
-    query_tokens = query.split()
-    item_tokens = item_text.split()
+    query_tokens = [t for t in query.split() if t and t not in STOPWORDS]
+    title_collection_tokens = set(
+        normalize_text(" ".join([item.title, item.collection])).split()
+    )
+    creator_tokens = set(normalize_text(item.creator).split())
     for token in query_tokens:
-        if token and token in item_tokens:
+        if token in creator_tokens:
+            score += 40
+        elif token in title_collection_tokens:
             score += 10
     title_text = normalize_text(item.title)
     if title_text and title_text in query:
@@ -157,7 +208,30 @@ def choose_best_item(items, user_text):
     if not items:
         return None
     requested_type = detect_requested_media_type(user_text)
-    return max(items, key=lambda item: score_item(item, user_text, requested_type))
+    best = max(items, key=lambda item: score_item(item, user_text, requested_type))
+    meaningful = _meaningful_query(user_text)
+    # On a meaningful query, refuse to play junk: if even the best match scores
+    # below a single token hit, the caller should say it found nothing rather
+    # than play an unrelated track. Generic "play music" (empty meaningful
+    # query) still returns the max-score item so browse-all playback works.
+    if meaningful and score_item(best, user_text, requested_type) < 10:
+        return None
+    # Token-coverage guard: for a meaningful query, the best item must match
+    # strictly more than half of the meaningful non-stopword tokens, otherwise
+    # it is an incidental substring hit (e.g. "taylor" matching "James Taylor"
+    # when the user said "Play Taylor Swift").
+    if meaningful:
+        meaningful_tokens = [t for t in normalize_text(meaningful).split() if t and t not in STOPWORDS]
+        if meaningful_tokens:
+            item_token_set = set(
+                normalize_text(
+                    " ".join([best.title, best.creator, best.collection])
+                ).split()
+            )
+            matched = sum(1 for t in meaningful_tokens if t in item_token_set)
+            if not (matched > len(meaningful_tokens) / 2):
+                return None
+    return best
 
 
 def build_music_queue(items, choice):
@@ -378,11 +452,105 @@ def _plex_parse_tracks(client, xml_text):
     return items
 
 
+def _parse_artist_directories(xml_text):
+    """Parse <Directory type="artist"> elements into (rating_key, title) tuples."""
+    if not xml_text:
+        return []
+    root = ET.fromstring(xml_text)
+    artists = []
+    for directory in root.findall(".//Directory"):
+        if directory.attrib.get("type", "") != "artist":
+            continue
+        rating_key = directory.attrib.get("ratingKey") or ""
+        title = directory.attrib.get("title") or ""
+        if rating_key and title:
+            artists.append((rating_key, title))
+    return artists
+
+
+def _plex_artist_first_candidates(client, user_text, audio_sections):
+    """Resolve the query to an artist and return that artist's tracks.
+
+    Returns a list of items on an artist hit, or None when no artist matched
+    (so the caller falls back to the generic search path).
+    """
+    phrases = candidate_artist_phrases(user_text)
+    if not phrases:
+        return None
+    for section_key in audio_sections:
+        if not section_key:
+            continue
+        path = f"/library/sections/{section_key}/all"
+        for phrase in phrases:
+            try:
+                artists = _parse_artist_directories(client.get_xml(path, {"type": "8", "title": phrase}))
+            except Exception as exc:
+                if client.logger:
+                    client.logger.warning(f"[PlexAudio] Artist lookup failed for {phrase!r}: {exc}")
+                continue
+            # Keep only artists whose every meaningful token appears in user_text.
+            accepted = [
+                (rating_key, artist_title)
+                for rating_key, artist_title in artists
+                if artist_matches_query(artist_title, user_text)
+            ]
+            if not accepted:
+                continue
+            # Prefer the most specific artist (most non-stopword tokens); tie-break on title length.
+            accepted.sort(
+                key=lambda rk_t: (
+                    len([t for t in normalize_text(rk_t[1]).split() if t not in STOPWORDS]),
+                    len(rk_t[1]),
+                ),
+                reverse=True,
+            )
+            for rating_key, artist_title in accepted:
+                try:
+                    tracks = client.parse_tracks(
+                        client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "artist.id": rating_key})
+                    )
+                except Exception as exc:
+                    if client.logger:
+                        client.logger.warning(f"[PlexAudio] Artist track lookup failed for {artist_title!r}: {exc}")
+                    continue
+                if tracks:
+                    return tracks
+    return None
+
+
 def _plex_search_audio(client, user_text):
     query = sanitize_search_query(user_text)
     meaningful = _meaningful_query(user_text)
     requested_type = detect_requested_media_type(user_text)
     candidates = []
+
+    audio_sections = []
+    try:
+        sections_xml = client.get_xml("/library/sections")
+        root = ET.fromstring(sections_xml)
+        for directory in root.findall(".//Directory"):
+            section_type = directory.attrib.get("type", "")
+            section_key = directory.attrib.get("key", "")
+            if section_type in {"artist", "music"} and section_key:
+                audio_sections.append(section_key)
+    except Exception as exc:
+        if client.logger:
+            client.logger.warning(f"[PlexAudio] Section discovery failed: {exc}")
+
+    # Artist-first: resolve the meaningful query to an artist and use their
+    # tracks as the candidate pool, skipping the generic search entirely.
+    if meaningful:
+        artist_tracks = _plex_artist_first_candidates(client, user_text, audio_sections)
+        if artist_tracks:
+            deduped = []
+            seen = set()
+            for item in artist_tracks:
+                key = item.part_key or "|".join([item.title, item.creator, item.collection])
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(item)
+            deduped.sort(key=lambda item: score_item(item, user_text, requested_type), reverse=True)
+            return deduped[:MAX_SEARCH_RESULTS]
 
     if meaningful:
         try:
@@ -392,24 +560,19 @@ def _plex_search_audio(client, user_text):
                 client.logger.warning(f"[PlexAudio] Global search failed: {exc}")
 
     try:
-        sections_xml = client.get_xml("/library/sections")
-        root = ET.fromstring(sections_xml)
-        for directory in root.findall(".//Directory"):
-            section_type = directory.attrib.get("type", "")
-            section_key = directory.attrib.get("key", "")
-            if section_type in {"artist", "music"} and section_key:
-                path = f"/library/sections/{section_key}/all"
-                if meaningful:
-                    title_matches = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "title": query}))
-                    candidates.extend(title_matches)
-                    if not title_matches:
-                        scanned = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE}))
-                        candidates.extend(
-                            item for item in scanned if score_item(item, user_text, None) > 0
-                        )
-                else:
+        for section_key in audio_sections:
+            path = f"/library/sections/{section_key}/all"
+            if meaningful:
+                title_matches = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE, "title": query}))
+                candidates.extend(title_matches)
+                if not title_matches:
                     scanned = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE}))
-                    candidates.extend(scanned)
+                    candidates.extend(
+                        item for item in scanned if score_item(item, user_text, None) > 0
+                    )
+            else:
+                scanned = client.parse_tracks(client.get_xml(path, {"type": AUDIO_SEARCH_TYPE}))
+                candidates.extend(scanned)
     except Exception as exc:
         if client.logger:
             client.logger.warning(f"[PlexAudio] Section search failed: {exc}")
@@ -464,16 +627,60 @@ def exit_requested(user_text):
     return text in EXIT_WORDS or any(text == normalize_text(word) for word in EXIT_WORDS)
 
 
+NEGATION_WORDS = {
+    "don", "dont", "do", "not", "won", "wont", "can", "cant", "cannot",
+    "never", "no",
+}
+# Normalizing strips apostrophes, so "don't" becomes "don t". When scanning
+# backwards for the word that precedes a command token, skip these clitic
+# fragments so "don t stop" is recognized as a negation of "stop".
+_CLITIC_FRAGMENTS = {"t", "s"}
+SHORT_UTTERANCE_LIMIT = 6
+
+
+def _command_token_is_negated(tokens, index):
+    """True when the meaningful token before tokens[index] is a negation."""
+    i = index - 1
+    while i >= 0:
+        if tokens[i] in _CLITIC_FRAGMENTS:
+            i -= 1
+            continue
+        return tokens[i] in NEGATION_WORDS
+    return False
+
+
+def _has_unnegated_command(tokens, command_words):
+    for i, token in enumerate(tokens):
+        if token in command_words and not _command_token_is_negated(tokens, i):
+            return True
+    return False
+
+
+def _phrase_present_unnegated(tokens, phrase):
+    """True when `phrase` appears in `tokens` without a preceding negation."""
+    phrase_tokens = phrase.split()
+    if not phrase_tokens:
+        return False
+    span = len(phrase_tokens)
+    for start in range(0, len(tokens) - span + 1):
+        if tokens[start:start + span] == phrase_tokens and not _command_token_is_negated(tokens, start):
+            return True
+    return False
+
+
 def playback_stop_requested(user_text):
     text = normalize_text(user_text)
     if not text:
         return False
     tokens = text.split()
     # Music playing near the mic produces noisy transcriptions ("don't stop believing"),
-    # so single stop words only count in short utterances.
-    if len(tokens) <= 4 and any(token in STOP_WORDS for token in tokens):
+    # so single stop words only count in short utterances, and never when negated
+    # ("please don't stop the music").
+    if len(tokens) <= SHORT_UTTERANCE_LIMIT and _has_unnegated_command(tokens, STOP_WORDS):
         return True
-    return any(phrase in text for phrase in STOP_PHRASES)
+    # STOP_PHRASES still match anywhere, but a negation in front of the phrase
+    # ("don't stop the music") cancels it.
+    return any(_phrase_present_unnegated(tokens, normalize_text(phrase)) for phrase in STOP_PHRASES)
 
 
 def playback_skip_requested(user_text):
@@ -485,8 +692,8 @@ def playback_skip_requested(user_text):
         return False
     tokens = text.split()
     # Music near the mic produces noisy transcriptions, so only short utterances
-    # count as a skip command.
-    if len(tokens) <= 4 and ("next" in tokens or "skip" in tokens):
+    # count as a skip command, and never when negated ("don't skip this one").
+    if len(tokens) <= SHORT_UTTERANCE_LIMIT and _has_unnegated_command(tokens, {"next", "skip"}):
         return True
     return False
 
@@ -777,7 +984,13 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 position_ms = int(status.get("position_ms") or position_ms)
                 if not status.get("playing"):
                     return position_ms, "ended", None
+            listen_started = time.monotonic()
             heard = await self._listen_during_playback()
+            # A hot listen loop: wait_for_complete_transcription has been observed
+            # returning instantly/empty (~1 poll/second), which would make the
+            # ability deaf. Throttle so instant-empty results can't spin.
+            if not normalize_text(heard) and (time.monotonic() - listen_started) < 1:
+                await self.worker.session_tasks.sleep(2)
             if heard:
                 if playback_stop_requested(heard):
                     await self._devkit_call("plex_duck", ["10"], 5)
@@ -900,6 +1113,22 @@ class PlexAudioPlayerCapability(MatchingCapability):
             if not user_request or exit_requested(user_request):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")
                 return
+
+            # STT sometimes finalizes early, leaving only a wake/command artifact
+            # (e.g. "Play"). Rather than browse-all and play random tracks, ask
+            # once what to play — but only when the request carries no generic
+            # intent ("music"/"audiobook"/"something") we could honor as-is.
+            normalized_request = normalize_text(user_request)
+            if not _meaningful_query(user_request) and not any(
+                word in normalized_request
+                for word in ["music", "audiobook", "book", "something", "anything"]
+            ):
+                user_request = await self.capability_worker.run_io_loop(
+                    "What would you like me to play from Plex?"
+                )
+                if not user_request or exit_requested(user_request):
+                    await self.capability_worker.speak("Okay, I will leave Plex closed.")
+                    return
 
             # --- Resume audiobook ---
             if resume_requested(user_request):
