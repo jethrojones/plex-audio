@@ -83,14 +83,21 @@ _SANITIZE_PATTERNS = [
 STOPWORDS = {
     "i", "ll", "im", "ive", "id", "a", "an", "the", "to", "of", "for", "and",
     "or", "me", "my", "we", "you", "it", "is", "on", "in", "at", "from", "some",
-    "please", "play", "plex", "music", "song", "track", "album", "artist",
-    "library", "put", "open", "home", "openhome", "oh", "hey", "like", "want",
-    "hear", "listen", "audiobook", "book",
+    "please", "play", "playing", "by", "plex", "music", "song", "track", "album",
+    "artist", "library", "put", "open", "home", "openhome", "oh", "hey", "like",
+    "want", "hear", "listen", "audiobook", "book",
+}
+
+_NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10",
 }
 
 
 def normalize_text(value):
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return " ".join(_NUMBER_WORDS.get(token, token) for token in cleaned.split())
 
 
 def artist_matches_query(artist_title, user_text):
@@ -212,6 +219,14 @@ def choose_best_item(items, user_text):
     requested_type = detect_requested_media_type(user_text)
     best = max(items, key=lambda item: score_item(item, user_text, requested_type))
     meaningful = _meaningful_query(user_text)
+    # A fully-named artist is decisive evidence: if every meaningful token of the
+    # chosen item's artist name appears in the query, return it before the score
+    # and token-coverage guards. This rescues garbled requests like "Metallica
+    # from Platt" where extra noise tokens would otherwise veto the right artist.
+    # Taylor-Swift protection still holds: artist_matches_query("James Taylor",
+    # "Play Taylor Swift") is False, so that case falls through to the guards.
+    if artist_matches_query(best.creator, user_text):
+        return best
     # On a meaningful query, refuse to play junk: if even the best match scores
     # below a single token hit, the caller should say it found nothing rather
     # than play an unrelated track. Generic "play music" (empty meaningful

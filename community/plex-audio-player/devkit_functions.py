@@ -74,14 +74,21 @@ _SANITIZE_PATTERNS = [
 STOPWORDS = {
     "i", "ll", "im", "ive", "id", "a", "an", "the", "to", "of", "for", "and",
     "or", "me", "my", "we", "you", "it", "is", "on", "in", "at", "from", "some",
-    "please", "play", "plex", "music", "song", "track", "album", "artist",
-    "library", "put", "open", "home", "openhome", "oh", "hey", "like", "want",
-    "hear", "listen", "audiobook", "book",
+    "please", "play", "playing", "by", "plex", "music", "song", "track", "album",
+    "artist", "library", "put", "open", "home", "openhome", "oh", "hey", "like",
+    "want", "hear", "listen", "audiobook", "book",
+}
+
+_NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10",
 }
 
 
 def normalize_text(value):
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return " ".join(_NUMBER_WORDS.get(token, token) for token in cleaned.split())
 
 
 def artist_matches_query(artist_title, user_text):

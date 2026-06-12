@@ -845,6 +845,79 @@ def test_choose_best_item_accepts_3_doors_down_track():
 
 
 # ---------------------------------------------------------------------------
+# Fix 3: number-word normalization + full-artist-match overrides coverage guard
+# ---------------------------------------------------------------------------
+
+def test_normalize_text_maps_number_words_to_digits():
+    """Standalone number words become digits, but embedded ones are untouched."""
+    mod = load_ability_module()
+    assert mod.normalize_text("three doors down") == "3 doors down"
+    # "threesome" is one token, not the number word "three" — leave it alone.
+    assert mod.normalize_text("threesome") == "threesome"
+
+
+def test_choose_best_item_metallica_survives_garbled_plex_token():
+    """Production STT: 'Plex' garbled to 'Platt'. A full Metallica artist match
+    must beat the token-coverage guard ({metallica, platt} would be 1 of 2)."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Enter Sandman", "Metallica", "Metallica", "music", "/sandman.mp3", 330000, "m1"),
+        mod.PlexAudioItem("I'll Be Home for Christmas", "Bing Crosby", "Holiday", "music", "/xmas.mp3", 180000, "x1"),
+    ]
+    choice = mod.choose_best_item(items, "Play music Metallica from Platt.")
+    assert choice is not None
+    assert choice.part_key == "/sandman.mp3"
+
+
+def test_choose_best_item_three_doors_down_digit_artist():
+    """Production STT: 'three doors down' (word) vs catalog '3 Doors Down' (digit).
+    normalize_text maps 'three'->'3', so the full artist match is recognized."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Kryptonite", "3 Doors Down", "The Better Life", "music", "/3dd.mp3", 220000, "3dd1"),
+    ]
+    choice = mod.choose_best_item(items, "Playing music by three doors down Plex.")
+    assert choice is not None
+    assert choice.part_key == "/3dd.mp3"
+
+
+def test_choose_best_item_taylor_swift_regression_still_none():
+    """Regression: 'Play Taylor Swift' with only James Taylor items still None —
+    artist_matches_query('James Taylor', ...) is False, so guards still apply."""
+    mod = load_ability_module()
+    items = [
+        mod.PlexAudioItem("Fire and Rain", "James Taylor", "Sweet Baby James", "music", "/jt.mp3", 200000, "jt1"),
+        mod.PlexAudioItem("Carolina in My Mind", "James Taylor", "James Taylor", "music", "/jt2.mp3", 210000, "jt2"),
+    ]
+    assert mod.choose_best_item(items, "Play Taylor Swift") is None
+
+
+def test_candidate_artist_phrases_normalizes_three_to_digit():
+    """The artist n-gram sent to Plex's ?title= filter must be '3 doors down'."""
+    mod = load_ability_module()
+    phrases = mod.candidate_artist_phrases("Playing music by three doors down Plex.")
+    assert "3 doors down" in phrases
+
+
+def test_normalize_text_parity_main_devkit():
+    """main.py and devkit_functions.py normalize_text must behave identically."""
+    mod = load_ability_module()
+    dev = load_devkit_module()
+    cases = [
+        "three doors down",
+        "threesome",
+        "Play music Metallica from Platt.",
+        "Playing music by three doors down Plex.",
+        "one two three four five six seven eight nine ten zero",
+        "eleven twentyone tenth",
+    ]
+    for text in cases:
+        assert mod.normalize_text(text) == dev.normalize_text(text), (
+            f"normalize_text parity failure for {text!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2: Plex account linking (PIN OAuth flow) — pure helpers
 # ---------------------------------------------------------------------------
 
