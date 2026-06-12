@@ -756,6 +756,28 @@ def playback_new_request(user_text):
     return bool(re.search(r"\bplay\b", text))
 
 
+STALE_REPEAT_WINDOW_SECONDS = 5
+
+
+def is_stale_repeat(heard, last_text, last_at, now):
+    """True when `heard` is the same (normalized) utterance we already processed
+    within STALE_REPEAT_WINDOW_SECONDS.
+
+    wait_for_complete_transcription has been observed re-returning the same stale
+    transcription on consecutive polls; treating such a repeat as silence keeps
+    the playback loop from re-firing stop/skip/new_request on one utterance.
+    Empty `heard` is never a stale repeat (the empty-result throttle handles it).
+    """
+    normalized = normalize_text(heard)
+    if not normalized:
+        return False
+    if not last_text or normalize_text(last_text) != normalized:
+        return False
+    if last_at is None:
+        return False
+    return (now - last_at) <= STALE_REPEAT_WINDOW_SECONDS
+
+
 def parse_devkit_payload(output_text):
     text = str(output_text or "").strip()
     if not text:
@@ -1000,6 +1022,19 @@ class PlexAudioPlayerCapability(MatchingCapability):
             await self.worker.session_tasks.sleep(PLAYBACK_LISTEN_WINDOW_SECONDS)
             return None
 
+    async def _stop_devkit_playback(self):
+        """Stop mpv on the DevKit, retrying once. Returns the final (data, error).
+
+        plex_stop is the only thing that kills the detached mpv process, so a
+        single failed call can orphan music. Retry once after a short pause; the
+        DevKit reports was_playing=false when nothing was playing, so a redundant
+        call is harmless."""
+        data, error = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+        if data is None:
+            await self.worker.session_tasks.sleep(2)
+            data, error = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+        return data, error
+
     async def _devkit_playback(self, client, item, offset_ms, allow_switch=False):
         """Play on the DevKit and wait for finish or a spoken command.
 
@@ -1026,34 +1061,61 @@ class PlexAudioPlayerCapability(MatchingCapability):
         )
         if data is None:
             raise RuntimeError(f"DevKit playback failed: {error}")
+        # A successful plex_play means mpv is now running detached on the DevKit;
+        # the run() finally must stop it on any exit (including cancellation) so
+        # the orphan-mpv incident cannot recur.
+        self._devkit_playback_started = True
 
         started = time.monotonic()
         position_ms = int(offset_ms or 0)
         status_failures = 0
+        stop_attempts = 0
+        last_heard_text = None
+        last_heard_at = None
         while time.monotonic() - started < MAX_PLAYBACK_SECONDS:
+            iteration_started = time.monotonic()
             # Platform-driven stop/pause: the runtime sets these events when the
             # user asks to stop or pause during music mode. Same device action
             # here (mpv is killed); callers persist audiobook positions.
             if hasattr(self.worker, "music_mode_stop_event") and self.worker.music_mode_stop_event.is_set():
                 await self._devkit_call("plex_duck", ["10"], 5)
-                stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                stop_data, _ = await self._stop_devkit_playback()
                 if stop_data is not None:
                     position_ms = int(stop_data.get("position_ms") or position_ms)
-                await self.capability_worker.speak("Okay, stopping Plex.")
-                return position_ms, "stopped", None
+                    await self.capability_worker.speak("Okay, stopping Plex.")
+                    return position_ms, "stopped", None
+                stop_attempts += 1
+                if stop_attempts >= 3:
+                    await self.capability_worker.speak(
+                        "I can't reach the device to stop the music. You may need to restart it."
+                    )
+                    return position_ms, "stopped", None
+                await self.capability_worker.speak("I couldn't stop the player. I'll keep trying.")
+                continue
             if hasattr(self.worker, "music_mode_pause_event") and self.worker.music_mode_pause_event.is_set():
                 await self._devkit_call("plex_duck", ["10"], 5)
-                stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                stop_data, _ = await self._stop_devkit_playback()
                 if stop_data is not None:
                     position_ms = int(stop_data.get("position_ms") or position_ms)
-                await self.capability_worker.speak("Okay, pausing Plex.")
-                return position_ms, "stopped", None
+                    await self.capability_worker.speak("Okay, pausing Plex.")
+                    return position_ms, "stopped", None
+                stop_attempts += 1
+                if stop_attempts >= 3:
+                    await self.capability_worker.speak(
+                        "I can't reach the device to stop the music. You may need to restart it."
+                    )
+                    return position_ms, "stopped", None
+                await self.capability_worker.speak("I couldn't stop the player. I'll keep trying.")
+                continue
             status, status_error = await self._devkit_call("plex_status", [], DEVKIT_CONTROL_TIMEOUT)
             if status is None:
                 status_failures += 1
                 self.worker.editor_logging_handler.warning(f"[PlexAudio] Status check failed: {status_error}")
                 if status_failures >= 3:
-                    break
+                    # The DevKit is unreachable. Don't let the queue advance to the
+                    # next track on a dead device — best-effort stop and report lost.
+                    await self._stop_devkit_playback()
+                    return position_ms, "lost", None
             else:
                 status_failures = 0
                 position_ms = int(status.get("position_ms") or position_ms)
@@ -1066,14 +1128,32 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # ability deaf. Throttle so instant-empty results can't spin.
             if not normalize_text(heard) and (time.monotonic() - listen_started) < 1:
                 await self.worker.session_tasks.sleep(2)
+            # Stale-transcription dedupe: the same non-empty utterance has been
+            # observed re-returning on back-to-back polls (instant, non-empty),
+            # bypassing the empty-result throttle. Treat a recent repeat as
+            # silence so one utterance fires a command at most once.
+            now = time.monotonic()
+            if is_stale_repeat(heard, last_heard_text, last_heard_at, now):
+                heard = None
+            elif normalize_text(heard):
+                last_heard_text = heard
+                last_heard_at = now
             if heard:
                 if playback_stop_requested(heard):
                     await self._devkit_call("plex_duck", ["10"], 5)
-                    stop_data, _ = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+                    stop_data, _ = await self._stop_devkit_playback()
                     if stop_data is not None:
                         position_ms = int(stop_data.get("position_ms") or position_ms)
-                    await self.capability_worker.speak("Okay, stopping Plex.")
-                    return position_ms, "stopped", None
+                        await self.capability_worker.speak("Okay, stopping Plex.")
+                        return position_ms, "stopped", None
+                    stop_attempts += 1
+                    if stop_attempts >= 3:
+                        await self.capability_worker.speak(
+                            "I can't reach the device to stop the music. You may need to restart it."
+                        )
+                        return position_ms, "stopped", None
+                    await self.capability_worker.speak("I couldn't stop the player. I'll keep trying.")
+                    continue
                 if allow_switch and playback_skip_requested(heard):
                     await self._devkit_call("plex_duck", ["10"], 5)
                     await self.capability_worker.speak("Okay, next.")
@@ -1081,7 +1161,13 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 if allow_switch and playback_new_request(heard):
                     await self._devkit_call("plex_duck", ["20"], 5)
                     return position_ms, "new_request", heard
-        await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+            # Minimum cycle time: a complete status+listen iteration that took
+            # under 2 seconds (e.g. instant status + instant non-empty listen)
+            # would hot-loop, so sleep the remainder before the next iteration.
+            iteration_elapsed = time.monotonic() - iteration_started
+            if iteration_elapsed < 2:
+                await self.worker.session_tasks.sleep(2 - iteration_elapsed)
+        await self._stop_devkit_playback()
         return position_ms, "ended", None
 
     async def _get_initial_request(self):
@@ -1287,6 +1373,9 @@ class PlexAudioPlayerCapability(MatchingCapability):
     async def run(self):
         base_url = ""
         devkit_mode = False
+        # Reset per-session so a reused capability instance never thinks a prior
+        # session's playback is still active.
+        self._devkit_playback_started = False
         try:
             base_url, token, account_token, server_name, machine_identifier, missing = self._get_required_config()
             if missing:
@@ -1365,12 +1454,33 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 devkit_mode = True
 
             user_request = await self._get_initial_request()
+            # Duck any in-progress music (possibly from an orphaned earlier
+            # session) so every spoken response below is audible over it. It's a
+            # no-op on the DevKit when nothing is playing.
+            await self._devkit_call("plex_duck", ["20"], 5)
             if not user_request or exit_requested(user_request):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")
                 return
 
             if link_requested(user_request):
                 await self._link_plex_account()
+                return
+
+            # Fresh-session stop kill-switch: a "stop the music" request landing in
+            # a brand-new session (no capability attached to the orphaned playback)
+            # must still kill mpv on the DevKit, rather than letting the default
+            # agent falsely claim it stopped.
+            if playback_stop_requested(user_request):
+                await self._devkit_call("plex_duck", ["10"], 5)
+                stop_data, _ = await self._stop_devkit_playback()
+                if stop_data is None:
+                    await self.capability_worker.speak(
+                        "I couldn't reach the OpenHome device to stop the music. Check that it's powered on."
+                    )
+                elif stop_data.get("was_playing"):
+                    await self.capability_worker.speak("Okay, Plex is stopped.")
+                else:
+                    await self.capability_worker.speak("Nothing is playing from Plex right now.")
                 return
 
             # STT sometimes finalizes early, leaving only a wake/command artifact
@@ -1412,8 +1522,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 return
 
             # --- New search ---
-            # Duck any in-progress music so the user can hear the response.
-            await self._devkit_call("plex_duck", ["20"], 5)
+            # (Music was already ducked right after the initial request.)
             await self.capability_worker.speak("Searching your Plex audio libraries.")
             if devkit_mode:
                 items = await self._devkit_search(client, user_request)
@@ -1460,6 +1569,11 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 )
                 if action == "stopped":
                     return
+                if action == "lost":
+                    await self.capability_worker.speak(
+                        "I lost contact with the OpenHome device, so I'm stopping Plex playback."
+                    )
+                    return
                 if action == "skip":
                     i += 1
                     offset = 0
@@ -1481,7 +1595,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 offset = 0
 
             # Queue exhausted. If the last action was a skip, mpv is still playing ducked — stop it.
-            await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
+            await self._stop_devkit_playback()
 
         except Exception as exc:
             self.worker.editor_logging_handler.error(f"[PlexAudio] Error: {exc}")
@@ -1489,5 +1603,19 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # If we ducked in-progress music but never started new playback, restore its volume.
             await self._devkit_call("plex_duck", ["100"], 5)
         finally:
+            # Never orphan mpv: if a DevKit playback was started, stop it before
+            # tearing down music mode. This runs even on asyncio.CancelledError
+            # (which the except above does NOT catch), which is the one path that
+            # left mpv playing for minutes in the incident. Guard so finally can
+            # never raise while the session is tearing down.
+            # _devkit_playback_started is always initialized at the top of run()
+            # (the platform sandbox forbids getattr).
+            if devkit_mode and self._devkit_playback_started:
+                try:
+                    await self._stop_devkit_playback()
+                except Exception as exc:
+                    self.worker.editor_logging_handler.warning(
+                        f"[PlexAudio] Teardown stop failed: {exc}"
+                    )
             await self._music_mode_off()
             self.capability_worker.resume_normal_flow()

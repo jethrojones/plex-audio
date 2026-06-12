@@ -357,6 +357,47 @@ def test_playback_stop_requested_detects_short_stop_commands():
     assert not mod.playback_stop_requested("")
 
 
+def test_playback_stop_requested_detects_kill_switch_phrases():
+    """The fresh-session stop kill-switch relies on these phrases firing True."""
+    mod = load_ability_module()
+
+    assert mod.playback_stop_requested("stop the music")
+    assert mod.playback_stop_requested("pause")
+    assert mod.playback_stop_requested("stop")
+    assert mod.playback_stop_requested("stop plex")
+    assert mod.playback_stop_requested("turn it off")
+
+
+def test_is_stale_repeat_same_text_within_window_is_stale():
+    mod = load_ability_module()
+
+    # Same normalized utterance arriving 3s after the last one we processed.
+    assert mod.is_stale_repeat("Stop the music", "stop the music", 100.0, 103.0) is True
+
+
+def test_is_stale_repeat_same_text_after_window_is_fresh():
+    mod = load_ability_module()
+
+    # Same utterance but the window (5s) has elapsed — treat as a fresh command.
+    assert mod.is_stale_repeat("stop the music", "stop the music", 100.0, 106.0) is False
+
+
+def test_is_stale_repeat_different_text_is_fresh():
+    mod = load_ability_module()
+
+    assert mod.is_stale_repeat("next song", "stop the music", 100.0, 101.0) is False
+
+
+def test_is_stale_repeat_empty_heard_is_never_stale():
+    mod = load_ability_module()
+
+    # Empty heard is handled by the empty-result throttle, not the dedupe.
+    assert mod.is_stale_repeat("", "stop the music", 100.0, 101.0) is False
+    assert mod.is_stale_repeat(None, "stop the music", 100.0, 101.0) is False
+    # No prior text recorded yet.
+    assert mod.is_stale_repeat("stop", None, None, 101.0) is False
+
+
 def test_parse_devkit_payload_handles_clean_and_noisy_output():
     mod = load_ability_module()
 
