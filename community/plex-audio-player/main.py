@@ -1259,6 +1259,31 @@ class PlexAudioPlayerCapability(MatchingCapability):
             "That code expired before it was entered. Say \"link my Plex account\" to try again."
         )
 
+    async def _remote_fallback_client(self, account_token, server_name, machine_identifier, current_client):
+        """Try Plex.tv resource discovery for a remote-access endpoint.
+
+        Returns a new PlexAudioClient built from the remote connection, or None
+        if no account token is available or discovery finds nothing usable.
+        """
+        remote_token = account_token or self._linked_token()
+        if not remote_token:
+            return None
+        remote_connection = discover_plex_tv_resource(
+            remote_token,
+            server_name=server_name,
+            machine_identifier=machine_identifier,
+            preferred_subnets=None,
+            logger=self.worker.editor_logging_handler,
+            prefer_remote=True,
+        )
+        if remote_connection and remote_connection.get("base_url"):
+            return PlexAudioClient(
+                remote_connection.get("base_url"),
+                remote_connection.get("token") or current_client.token,
+                self.worker.editor_logging_handler,
+            )
+        return None
+
     async def run(self):
         base_url = ""
         devkit_mode = False
@@ -1281,26 +1306,20 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # Preferred path: the DevKit reaches Plex over the LAN and plays locally,
             # so the cloud runtime never needs a route to the Plex server.
             devkit_info = await self._devkit_diagnose(client.base_url, client.token)
+            _link_guidance = (
+                " If Plex remote access is enabled, say link my Plex account, "
+                "and I can stream from outside your network when the local connection is down."
+            )
             if devkit_info is None:
                 if _url_is_local(client.base_url):
                     # The DevKit is down and the only known Plex address is on the
                     # LAN, which the cloud runtime cannot reach. Before giving up,
                     # try Plex.tv resource discovery for a remote-access endpoint.
-                    remote_token = account_token or self._linked_token()
-                    remote_connection = discover_plex_tv_resource(
-                        remote_token,
-                        server_name=server_name,
-                        machine_identifier=machine_identifier,
-                        preferred_subnets=None,
-                        logger=self.worker.editor_logging_handler,
-                        prefer_remote=True,
-                    ) if remote_token else None
-                    if remote_connection and remote_connection.get("base_url"):
-                        client = PlexAudioClient(
-                            remote_connection.get("base_url"),
-                            remote_connection.get("token") or client.token,
-                            self.worker.editor_logging_handler,
-                        )
+                    remote_client = await self._remote_fallback_client(
+                        account_token, server_name, machine_identifier, client
+                    )
+                    if remote_client:
+                        client = remote_client
                         base_url = client.base_url
                         devkit_mode = False
                         await self.capability_worker.speak(
@@ -1310,16 +1329,32 @@ class PlexAudioPlayerCapability(MatchingCapability):
                         await self.capability_worker.speak(
                             "I could not connect to the OpenHome device to reach your Plex server. "
                             "Make sure the device is powered on and the Plex Audio ability is synced to it, then try again."
+                            + _link_guidance
                         )
                         return
                 else:
                     devkit_mode = False
             elif not devkit_info.get("plex_reachable"):
-                await self.capability_worker.speak(
-                    "Your OpenHome device is online, but it cannot reach the Plex server at the configured address. "
-                    "Check that Plex is running and that plex base url is the server's local network address, like its LAN IP and port 32400."
+                # DevKit is up but cannot reach Plex locally. Try remote access
+                # before giving up.
+                remote_client = await self._remote_fallback_client(
+                    account_token, server_name, machine_identifier, client
                 )
-                return
+                if remote_client:
+                    client = remote_client
+                    base_url = client.base_url
+                    devkit_mode = False
+                    await self.capability_worker.speak(
+                        "Your OpenHome device cannot reach Plex on your local network, "
+                        "so I'll stream from Plex remote access instead."
+                    )
+                else:
+                    await self.capability_worker.speak(
+                        "Your OpenHome device is online, but it cannot reach the Plex server at the configured address. "
+                        "Check that Plex is running and that plex base url is the server's local network address, like its LAN IP and port 32400."
+                        + _link_guidance
+                    )
+                    return
             elif not devkit_info.get("player"):
                 await self.capability_worker.speak(
                     "Your OpenHome device can reach Plex, but it has no audio player installed. "
