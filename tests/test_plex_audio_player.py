@@ -316,6 +316,45 @@ def test_parse_plex_tv_resources_can_match_machine_identifier():
     assert connection["token"] == "right-token"
 
 
+def test_parse_remote_plex_connections_returns_direct_before_relay_and_skips_local():
+    mod = load_ability_module()
+    xml = """
+    <MediaContainer>
+      <Device name="ombee" clientIdentifier="acdc" accessToken="server-token">
+        <Connection uri="http://10.0.0.136:32400" local="1" relay="0" />
+        <Connection uri="https://76-121-135-187.example.plex.direct:32400" local="0" relay="0" />
+        <Connection uri="https://relay-abc.example.plex.direct:443" local="0" relay="1" />
+      </Device>
+    </MediaContainer>
+    """
+
+    remote = mod.parse_remote_plex_connections(xml)
+
+    # Only the two non-local connections, with the direct endpoint first.
+    assert len(remote) == 2
+    assert remote[0]["base_url"] == "https://76-121-135-187.example.plex.direct:32400"
+    assert remote[0]["relay"] is False
+    assert remote[1]["base_url"] == "https://relay-abc.example.plex.direct:443"
+    assert remote[1]["relay"] is True
+    # The local connection is excluded.
+    assert all(conn["base_url"] != "http://10.0.0.136:32400" for conn in remote)
+
+
+def test_remote_plex_connections_orders_direct_before_relay():
+    mod = load_ability_module()
+    connections = [
+        {"base_url": "https://relay.example.plex.direct:443", "local": False, "relay": True, "token": "tok"},
+        {"base_url": "http://192.168.0.20:32400", "local": True, "relay": False, "token": "tok"},
+        {"base_url": "https://direct.example.plex.direct:32400", "local": False, "relay": False, "token": "tok"},
+    ]
+
+    remote = mod.remote_plex_connections(connections)
+
+    assert [conn["base_url"] for conn in remote] == [
+        "https://direct.example.plex.direct:32400",
+        "https://relay.example.plex.direct:443",
+    ]
+
 
 def test_ability_main_avoids_forbidden_socket_import():
     source = (Path(__file__).resolve().parents[1] / "community" / "plex-audio-player" / "main.py").read_text()
@@ -901,11 +940,12 @@ def test_cloud_reachable_client_probes_non_local_base_url_directly(monkeypatch):
     cap = _make_capability(mod)
 
     discovery_called = []
-    monkeypatch.setattr(
-        mod,
-        "discover_plex_tv_resource",
-        lambda *a, **k: discovery_called.append(True),
-    )
+
+    def fake_discover(*a, **k):
+        discovery_called.append(True)
+        return []
+
+    monkeypatch.setattr(mod, "discover_plex_tv_connections", fake_discover)
 
     probed = []
 
@@ -937,11 +977,15 @@ def test_cloud_reachable_client_uses_remote_discovery_for_local_base_url(monkeyp
 
     monkeypatch.setattr(
         mod,
-        "discover_plex_tv_resource",
-        lambda *a, **k: {
-            "base_url": "https://1-2-3-4.example.plex.direct:32400",
-            "token": "remote-tok",
-        },
+        "discover_plex_tv_connections",
+        lambda *a, **k: [
+            {
+                "base_url": "https://1-2-3-4.example.plex.direct:32400",
+                "token": "remote-tok",
+                "local": False,
+                "relay": False,
+            }
+        ],
     )
 
     def fake_get(url, timeout=None):
@@ -971,7 +1015,7 @@ def test_cloud_reachable_client_returns_none_when_probe_fails(monkeypatch):
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr(mod.requests, "get", boom)
-    monkeypatch.setattr(mod, "discover_plex_tv_resource", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "discover_plex_tv_connections", lambda *a, **k: [])
 
     assert cap._cloud_reachable_client(
         "https://plex.example:32400", "tok", "acct", None, None

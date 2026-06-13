@@ -371,9 +371,27 @@ def choose_best_plex_connection(connections, preferred_subnets=None, prefer_remo
     return candidates[0]
 
 
-def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None, preferred_subnets=None, prefer_remote=False):
+def remote_plex_connections(connections):
+    """All cloud-reachable (non-local) connections, direct endpoints before relay.
+
+    The OpenHome cloud cannot reach a LAN address. Behind double NAT a server's
+    direct remote endpoint is often unreachable too, so callers should try each
+    of these in order and fall back to the relay (slower, but works behind any
+    NAT) when the direct endpoints fail."""
+    remote = [
+        conn for conn in connections
+        if conn and conn.get("base_url")
+        and not conn.get("local")
+        and not _url_is_local(conn.get("base_url"))
+    ]
+    # Direct remote endpoints first (faster, unmetered); relay last (fallback).
+    remote.sort(key=lambda conn: 1 if conn.get("relay") else 0)
+    return remote
+
+
+def _parse_plex_connections(xml_text, server_name=None, machine_identifier=None, preferred_subnets=None):
     if not xml_text:
-        return None
+        return []
     root = ET.fromstring(xml_text)
     connections = []
     for device in root.findall(".//Device"):
@@ -388,6 +406,7 @@ def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None,
             if not uri:
                 continue
             local_flag = str(connection.attrib.get("local") or "").lower() in {"1", "true", "yes"}
+            relay_flag = str(connection.attrib.get("relay") or "").lower() in {"1", "true", "yes"}
             connections.append(
                 {
                     "base_url": uri.rstrip("/"),
@@ -395,9 +414,22 @@ def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None,
                     "name": name,
                     "machine_identifier": client_identifier,
                     "local": local_flag,
+                    "relay": relay_flag,
                 }
             )
-    return choose_best_plex_connection(connections, preferred_subnets, prefer_remote)
+    return connections
+
+
+def parse_plex_tv_resources(xml_text, server_name=None, machine_identifier=None, preferred_subnets=None, prefer_remote=False):
+    return choose_best_plex_connection(
+        _parse_plex_connections(xml_text, server_name, machine_identifier),
+        preferred_subnets,
+        prefer_remote,
+    )
+
+
+def parse_remote_plex_connections(xml_text, server_name=None, machine_identifier=None):
+    return remote_plex_connections(_parse_plex_connections(xml_text, server_name, machine_identifier))
 
 
 def discover_plex_tv_resource(account_token, server_name=None, machine_identifier=None, preferred_subnets=None, logger=None, prefer_remote=False):
@@ -417,6 +449,27 @@ def discover_plex_tv_resource(account_token, server_name=None, machine_identifie
         if logger:
             logger.warning(f"[PlexAudio] Plex.tv resource discovery failed: {exc}")
     return None
+
+
+def discover_plex_tv_connections(account_token, server_name=None, machine_identifier=None, logger=None):
+    """Return all cloud-reachable Plex connections (direct first, then relay)."""
+    token = str(account_token or "").strip()
+    if not token:
+        return []
+    try:
+        url = "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&X-Plex-Token=" + _url_quote(token)
+        headers = {
+            "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
+            "X-Plex-Product": "OpenHome PlexAudio",
+        }
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        connections = parse_remote_plex_connections(response.text, server_name, machine_identifier)
+        return connections
+    except Exception as exc:
+        if logger:
+            logger.warning(f"[PlexAudio] Plex.tv connection discovery failed: {exc}")
+    return []
 
 
 def _plex_url(client, path, params=None):
@@ -1148,26 +1201,17 @@ class PlexAudioPlayerCapability(MatchingCapability):
     def _cloud_reachable_client(self, base_url, token, account_token, server_name, machine_identifier):
         """Find a Plex connection the OpenHome cloud runtime can reach directly.
 
-        Cloud streaming needs a route to Plex from the cloud, which a LAN address
-        does not provide. When the configured base_url is already non-local, probe
-        it as-is. Otherwise ask Plex.tv for a genuinely remote (Remote Access)
-        connection. Returns a ready PlexAudioClient on a successful probe, or None.
-        """
+        A configured non-local base_url is probed first. Otherwise every remote
+        connection Plex.tv lists is probed in turn — direct endpoints first, then
+        the relay — returning the first that answers /identity. This is what lets
+        playback work behind double NAT, where the direct remote endpoint is dead
+        but the Plex Relay still tunnels through."""
         logger = self.worker.editor_logging_handler
         if base_url and not _url_is_local(base_url):
             candidate = PlexAudioClient(base_url, token, logger)
             if self._probe_cloud_connection(candidate):
                 return candidate
-            return None
-        connection = discover_plex_tv_resource(
-            account_token,
-            server_name=server_name,
-            machine_identifier=machine_identifier,
-            preferred_subnets=None,
-            logger=logger,
-            prefer_remote=True,
-        )
-        if connection and connection.get("base_url"):
+        for connection in discover_plex_tv_connections(account_token, server_name=server_name, machine_identifier=machine_identifier, logger=logger):
             candidate = PlexAudioClient(
                 connection.get("base_url"),
                 connection.get("token") or account_token,
@@ -1462,7 +1506,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 else:
                     await self.capability_worker.speak(
                         "I couldn't reach your Plex server from the cloud. "
-                        "Check that Remote Access is enabled on your Plex server and shows green, then try again."
+                        "If you're behind two routers, turn on Plex Relay in your Plex server's Remote Access settings, then try again."
                     )
                 return
             base_url = client.base_url
