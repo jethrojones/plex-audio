@@ -6,7 +6,7 @@
 
 ## What It Does
 
-Plex Audio Player gives your OpenHome Agent voice control over the music and audiobooks on your own Plex server. You ask for something out loud, and it plays.
+Plex Audio Player gives your OpenHome Agent voice control over the music and audiobooks on your own Plex server. You ask for something out loud, and it streams it directly from Plex through the OpenHome cloud.
 
 - **Play by artist or title** — "play Metallica from Plex", "play Kind of Blue".
 - **Continuous queues** — when you pick an artist or album, it keeps playing track after track instead of stopping after one song.
@@ -15,9 +15,9 @@ Plex Audio Player gives your OpenHome Agent voice control over the music and aud
 - **Stop / pause** — say "stop", "pause", or "stop the music" any time.
 - **Audiobook resume** — start an audiobook, come back later, and say "continue my audiobook" to pick up where you left off.
 
-Under the hood it can play your Plex audio in two ways. The **preferred** way streams through the OpenHome cloud using your linked Plex account — it works out of the box with no device or network setup. The **backup** way plays directly over your home network (LAN) from an OpenHome DevKit, which is lower latency and works without internet but requires an audio player installed on the device.
+Playback is always cloud streaming: the OpenHome cloud fetches audio directly from your Plex server. This requires either a linked Plex account (recommended) or a manually configured public `plex_base_url`. Your Plex server must have Remote Access enabled, or be reachable at a publicly accessible URL.
 
-## Quick Start (Preferred): Link Your Plex Account
+## Quick Start: Link Your Plex Account
 
 This is all most people need.
 
@@ -28,28 +28,11 @@ This is all most people need.
 
 No API keys, no URLs, no device to configure. The link is remembered, so you only do this once.
 
-## LAN Backup Mode (Optional, Advanced)
+## LED Visualizer (optional — OpenHome DevKit only)
 
-If you run an **OpenHome DevKit on the same network as your Plex server**, the Ability can play directly over the LAN. This is lower latency and keeps working even when your internet is down, because the audio never leaves your home network.
+When the Ability is synced to an OpenHome DevKit, the 24-pixel LED ring on the device automatically pulses in time with the music during playback. The visualizer reads the PulseAudio monitor source as audio streams through the device and drives the ring as a VU-meter bounce.
 
-This mode is **optional** and **automatic**:
-
-- When a Plex account is linked, **cloud streaming is used** as the primary path.
-- LAN playback is the **automatic backup** — used if cloud streaming is unavailable.
-- When **no account is linked**, LAN playback becomes the **primary** path.
-
-### Requirements for LAN mode
-
-- An **audio player binary on the device.** Raspberry Pi OS does **not** ship one preinstalled, so install one:
-
-  ```bash
-  sudo apt install mpv
-  ```
-
-  The Ability auto-detects `mpv`, `ffplay`, `cvlc`, or `mpg123`, in that order. `mpv` is recommended.
-- The DevKit and the Plex server on the **same network** (or routable subnets), and the Ability synced to the DevKit as a **Local Ability** from the Live Editor.
-
-In LAN mode the audio plays from a local player process on the DevKit rather than through the cloud, so a Plex server that is only reachable on your home LAN (no Remote Access required) works fine.
+Zero configuration required — no extra software, no API keys. On a DevKit the visualizer starts and stops automatically with each playback session. Agents without a DevKit simply skip it.
 
 ## Voice Commands
 
@@ -70,8 +53,8 @@ Tip: while music is playing near the microphone, only short commands are treated
 
 You normally don't need any of these — account linking handles everything. They exist for advanced or manual setups, and are configured via OpenHome's custom API key screen:
 
-- `plex_base_url` — your Plex server URL, e.g. `http://10.0.0.136:32400` (LAN) or a remote `plex.direct` URL. Skips discovery.
-- `plex_token` — a Plex server auth token (the `X-Plex-Token` value). Not needed if your Plex network allows the device subnet without auth.
+- `plex_base_url` — your Plex server's publicly reachable URL, e.g. a remote `plex.direct` URL or any URL the OpenHome cloud can reach. Skips discovery.
+- `plex_token` — a Plex server auth token (the `X-Plex-Token` value). Not needed if you use account linking.
 - `plex_account_token` — a Plex account token for Plex.tv resource discovery (an alternative to the spoken link flow).
 - `plex_server_name` — pick a specific server by name when your account has several.
 - `plex_machine_identifier` — pick one exact server by its machine identifier.
@@ -81,16 +64,15 @@ To find a token manually: sign in to the Plex Web App, open a library item, choo
 ## Troubleshooting
 
 - **"I couldn't find that"** — Check that the artist/title matches what's actually in your Plex library. Try the exact album, artist, or book name. Generic requests like "play music" browse everything.
-- **Device not reachable (LAN mode)** — Make sure the DevKit is powered on, on the same network as Plex, and that the Ability is synced to it as a Local Ability. Confirm an audio player is installed (`sudo apt install mpv`).
 - **No remote streaming / cloud playback fails** — Re-link your account ("link my Plex account") and confirm Plex **Remote Access** shows **green** in your server settings. Cloud streaming needs the OpenHome cloud to reach your server from the internet.
 - **Token rejected** — If you set `plex_token` or `plex_account_token` manually, the value may be stale. Re-copy it, or use the spoken link flow instead.
 
 ## How It Works
 
 1. You trigger the Ability and ask for music or an audiobook.
-2. If a Plex account is linked (or `plex_account_token` is set) and the OpenHome cloud can reach your server, the Ability streams audio **through the cloud** — the preferred path. Selecting this path skips the DevKit diagnostic, so playback starts faster.
-3. Otherwise it falls back to the **DevKit/LAN** path: it confirms the DevKit can reach Plex and has an audio player, then plays locally.
-4. It searches your Plex audio libraries, scores the matches against your spoken request, and picks the best one (music vs audiobook is inferred from library metadata and track length).
+2. The Ability resolves a cloud-reachable Plex connection: a non-local `plex_base_url` is probed as-is; otherwise it discovers a Remote Access endpoint via the linked account token from Plex.tv.
+3. It searches your Plex audio libraries using an artist-first strategy: it tries to resolve the query to an exact artist in your library, then falls back to title and full-library search.
+4. Matches are scored and the best one is selected (music vs audiobook is inferred from library metadata and track length).
 5. Music plays as a **continuous queue** with voice stop, next/skip, and mid-song switching. Audiobooks play as a single long track, and the position is saved so you can resume later.
 6. Control returns to the Agent when playback ends or you stop it.
 
@@ -100,7 +82,7 @@ Run local checks from the repo root:
 
 ```bash
 python3 -m pytest tests/ -q
-python3 -m py_compile community/plex-audio-player/main.py
+python3 -m py_compile community/plex-audio-player/main.py community/plex-audio-player/devkit_functions.py
 python3 validate_ability.py community/plex-audio-player
 ```
 

@@ -411,117 +411,6 @@ def test_parse_devkit_payload_handles_clean_and_noisy_output():
     assert mod.parse_devkit_payload("not json at all") is None
 
 
-def test_items_from_search_payload_builds_audio_items():
-    mod = load_ability_module()
-    payload = {
-        "items": [
-            {
-                "title": "So What",
-                "creator": "Miles Davis",
-                "collection": "Kind of Blue",
-                "media_type": "music",
-                "part_key": "/library/parts/1/file.mp3",
-                "duration_ms": 545000,
-                "rating_key": "song1",
-            },
-            {"title": "No part key", "part_key": ""},
-        ]
-    }
-
-    items = mod.items_from_search_payload(payload)
-
-    assert len(items) == 1
-    assert items[0].title == "So What"
-    assert items[0].media_type == "music"
-    assert items[0].duration_ms == 545000
-    assert mod.items_from_search_payload(None) == []
-
-
-def test_devkit_plex_url_adds_token_and_download_params():
-    dev = load_devkit_module()
-
-    url = dev.plex_url("http://10.0.0.136:32400/", "/library/parts/7/file.m4b", "tok", {"download": "1"})
-
-    assert url.startswith("http://10.0.0.136:32400/library/parts/7/file.m4b?")
-    assert "X-Plex-Token=tok" in url
-    assert "download=1" in url
-
-
-def test_devkit_detect_player_uses_priority_order():
-    dev = load_devkit_module()
-
-    assert dev.detect_player(which=lambda name: name in {"ffplay", "mpg123"}) == "ffplay"
-    assert dev.detect_player(which=lambda name: name == "mpv") == "mpv"
-    assert dev.detect_player(which=lambda name: None) is None
-
-
-def test_devkit_build_player_command_includes_offset_for_mpv_and_ffplay():
-    dev = load_devkit_module()
-
-    mpv = dev.build_player_command("mpv", "http://plex/stream", offset_seconds=125)
-    ffplay = dev.build_player_command("ffplay", "http://plex/stream", offset_seconds=125)
-
-    assert "--start=125" in mpv
-    assert mpv[-1] == "http://plex/stream"
-    assert "-ss" in ffplay
-    assert ffplay[ffplay.index("-ss") + 1] == "125"
-
-
-def test_devkit_search_scores_sorts_and_caps_results():
-    dev = load_devkit_module()
-    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
-    empty_xml = '<MediaContainer size="0" />'
-    all_tracks_xml = """
-    <MediaContainer>
-      <Track title="Enter Sandman" grandparentTitle="Metallica" parentTitle="Metallica" ratingKey="s1">
-        <Media duration="330000"><Part key="/library/parts/1/file.mp3" /></Media>
-      </Track>
-      <Track title="Unrelated" grandparentTitle="Someone Else" parentTitle="Other" ratingKey="s2">
-        <Media duration="200000"><Part key="/library/parts/2/file.mp3" /></Media>
-      </Track>
-    </MediaContainer>
-    """
-
-    def fake_get(url, timeout=None):
-        if "/search" in url:
-            return empty_xml
-        if "/library/sections/6/all" in url and "title=" in url:
-            return empty_xml
-        if "/library/sections/6/all" in url:
-            return all_tracks_xml
-        return sections_xml
-
-    items = dev.search_plex_audio("http://10.0.0.136:32400", "tok", "play Metallica on plex", get_text=fake_get)
-
-    assert [item["title"] for item in items] == ["Enter Sandman"]
-    assert items[0]["media_type"] == "music"
-
-
-def test_devkit_diagnose_always_reports_instead_of_erroring(capsys):
-    dev = load_devkit_module()
-    original_get = dev._http_get_text
-    dev._http_get_text = lambda url, timeout=None: (_ for _ in ()).throw(OSError("Connection refused"))
-    try:
-        dev.plex_diagnose("http://10.0.0.136:32400", "tok")
-    finally:
-        dev._http_get_text = original_get
-
-    payload = json.loads(capsys.readouterr().out.strip())
-
-    assert payload["success"] is True
-    assert payload["data"]["plex_reachable"] is False
-    assert "Connection refused" in payload["data"]["detail"]
-    assert "player" in payload["data"]
-
-
-def test_devkit_current_position_ms_accumulates_from_offset():
-    dev = load_devkit_module()
-    state = {"offset_ms": 5000, "started_at": 1000.0, "duration_ms": 60000}
-
-    assert dev.current_position_ms(state, now=1010.0) == 15000
-    assert dev.current_position_ms(state, now=2000.0) == 60000
-    assert dev.current_position_ms(None) == 0
-
 
 def test_meaningful_query_strips_generic_request_to_empty():
     mod = load_ability_module()
@@ -564,38 +453,6 @@ def test_search_audio_browse_all_for_generic_request():
 
     assert len(items) == 2
 
-
-def test_devkit_meaningful_query_strips_generic_request_to_empty():
-    dev = load_devkit_module()
-
-    assert dev._meaningful_query("play music") == ""
-    assert dev._meaningful_query("play audiobook from plex") == ""
-    assert dev._meaningful_query("play Dune audiobook") == "Dune"
-
-
-def test_devkit_search_browse_all_for_generic_request():
-    """Generic 'play music' request should return all section tracks without score filtering."""
-    dev = load_devkit_module()
-    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
-    all_tracks_xml = """
-    <MediaContainer>
-      <Track title="So What" grandparentTitle="Miles Davis" parentTitle="Kind of Blue" ratingKey="s1">
-        <Media duration="545000"><Part key="/library/parts/1/file.mp3" /></Media>
-      </Track>
-      <Track title="Unrelated" grandparentTitle="Other Artist" parentTitle="Other Album" ratingKey="s2">
-        <Media duration="200000"><Part key="/library/parts/2/file.mp3" /></Media>
-      </Track>
-    </MediaContainer>
-    """
-
-    def fake_get(url, timeout=None):
-        if "/library/sections/6/all" in url:
-            return all_tracks_xml
-        return sections_xml
-
-    items = dev.search_plex_audio("http://10.0.0.136:32400", "tok", "play music", get_text=fake_get)
-
-    assert len(items) == 2
 
 
 def test_playback_skip_requested_detects_short_next_and_skip_commands():
@@ -677,13 +534,6 @@ def test_candidate_artist_phrases_drops_stopwords_and_orders_longest_first():
     assert "from" not in multi and "plex" not in multi
 
 
-def test_candidate_artist_phrases_matches_devkit_implementation():
-    mod = load_ability_module()
-    dev = load_devkit_module()
-
-    text = "I'll put home Play Metallica from Plex."
-    assert mod.candidate_artist_phrases(text) == dev.candidate_artist_phrases(text)
-
 
 def test_playback_stop_and_skip_respect_negation():
     mod = load_ability_module()
@@ -695,64 +545,6 @@ def test_playback_stop_and_skip_respect_negation():
     # Negated skip must not skip.
     assert mod.playback_skip_requested("don't skip this one") is False
 
-
-def test_devkit_score_item_weights_creator_above_title():
-    dev = load_devkit_module()
-    by_artist = {
-        "title": "Some Song",
-        "creator": "Metallica",
-        "collection": "Album",
-        "media_type": "music",
-        "part_key": "/a.mp3",
-        "duration_ms": 1,
-        "rating_key": "a",
-    }
-    by_title = {
-        "title": "Metallica Tribute",
-        "creator": "Cover Band",
-        "collection": "Album",
-        "media_type": "music",
-        "part_key": "/b.mp3",
-        "duration_ms": 1,
-        "rating_key": "b",
-    }
-
-    assert dev.score_item(by_artist, "play metallica") > dev.score_item(by_title, "play metallica")
-
-
-def test_devkit_search_artist_first_returns_only_that_artist():
-    """An artist hit should return the artist's tracks, skipping generic search."""
-    dev = load_devkit_module()
-    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
-    artist_dir_xml = (
-        '<MediaContainer>'
-        '<Directory ratingKey="20495" type="artist" title="Metallica" />'
-        '</MediaContainer>'
-    )
-    artist_tracks_xml = """
-    <MediaContainer>
-      <Track title="Enter Sandman" grandparentTitle="Metallica" parentTitle="Metallica" ratingKey="s1">
-        <Media duration="330000"><Part key="/library/parts/1/file.mp3" /></Media>
-      </Track>
-      <Track title="One" grandparentTitle="Metallica" parentTitle="...And Justice" ratingKey="s2">
-        <Media duration="446000"><Part key="/library/parts/2/file.mp3" /></Media>
-      </Track>
-    </MediaContainer>
-    """
-
-    def fake_get(url, timeout=None):
-        if "type=8" in url and "title=metallica" in url:
-            return artist_dir_xml
-        if "artist.id=20495" in url:
-            return artist_tracks_xml
-        if "/library/sections/6/all" in url:
-            return "<MediaContainer />"  # generic path would return nothing
-        return sections_xml
-
-    items = dev.search_plex_audio("http://10.0.0.136:32400", "", "play metallica", get_text=fake_get)
-
-    assert {item["creator"] for item in items} == {"Metallica"}
-    assert {item["title"] for item in items} == {"Enter Sandman", "One"}
 
 
 def test_build_music_queue_prefers_same_artist_then_falls_back_to_wraparound():
@@ -800,22 +592,6 @@ def test_artist_matches_query_accepts_multi_token_artist():
     mod = load_ability_module()
     assert mod.artist_matches_query("3 Doors Down", "play 3 doors down") is True
 
-
-def test_artist_matches_query_parity_main_devkit():
-    """main.py and devkit_functions.py implementations must behave identically."""
-    mod = load_ability_module()
-    dev = load_devkit_module()
-
-    cases = [
-        ("James Taylor", "Play Taylor Swift"),
-        ("Metallica", "I'll put home Play Metallica from Plex."),
-        ("The Beatles", "play the beatles"),
-        ("3 Doors Down", "play 3 doors down"),
-    ]
-    for artist, query in cases:
-        assert mod.artist_matches_query(artist, query) == dev.artist_matches_query(artist, query), (
-            f"Parity failure for artist_matches_query({artist!r}, {query!r})"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -899,22 +675,19 @@ def test_candidate_artist_phrases_normalizes_three_to_digit():
     assert "3 doors down" in phrases
 
 
-def test_normalize_text_parity_main_devkit():
-    """main.py and devkit_functions.py normalize_text must behave identically."""
+def test_normalize_text_additional_cases():
+    """normalize_text handles number words, punctuation stripping, and unmapped words."""
     mod = load_ability_module()
-    dev = load_devkit_module()
-    cases = [
-        "three doors down",
-        "threesome",
-        "Play music Metallica from Platt.",
-        "Playing music by three doors down Plex.",
-        "one two three four five six seven eight nine ten zero",
-        "eleven twentyone tenth",
-    ]
-    for text in cases:
-        assert mod.normalize_text(text) == dev.normalize_text(text), (
-            f"normalize_text parity failure for {text!r}"
-        )
+    # Number-word conversion for all mapped digits.
+    assert mod.normalize_text("one two three four five six seven eight nine ten zero") == \
+        "1 2 3 4 5 6 7 8 9 10 0"
+    # Non-mapped number words pass through unchanged.
+    assert mod.normalize_text("eleven twentyone tenth") == "eleven twentyone tenth"
+    # Punctuation is stripped; mixed case normalized.
+    assert mod.normalize_text("Play music Metallica from Platt.") == "play music metallica from platt"
+    # Full phrase with number word in the middle.
+    assert mod.normalize_text("Playing music by three doors down Plex.") == \
+        "playing music by 3 doors down plex"
 
 
 # ---------------------------------------------------------------------------
@@ -1316,3 +1089,106 @@ def test_viz_registry_contains_all_three_viz_entries():
     dev = load_devkit_module()
     for name in ("leds_viz_start", "leds_viz_stop", "leds_viz_run"):
         assert name in dev.FUNCTION_REGISTRY, f"missing {name!r} from FUNCTION_REGISTRY"
+
+
+# ---------------------------------------------------------------------------
+# main.py coverage for behaviors previously only tested via devkit copies
+# ---------------------------------------------------------------------------
+
+
+def test_score_item_weights_creator_above_title():
+    """main.py score_item: creator match outscores title-only match for same query."""
+    mod = load_ability_module()
+    by_artist = mod.PlexAudioItem("Some Song", "Metallica", "Album", "music", "/a.mp3", 1, "a")
+    by_title = mod.PlexAudioItem("Metallica Tribute", "Cover Band", "Album", "music", "/b.mp3", 1, "b")
+
+    assert mod.score_item(by_artist, "play metallica") > mod.score_item(by_title, "play metallica")
+
+
+def test_search_audio_artist_first_returns_only_that_artist():
+    """Artist-first path in _plex_search_audio: an artist directory hit returns that
+    artist's tracks and skips the generic search path entirely."""
+    mod = load_ability_module()
+    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
+    artist_dir_xml = (
+        '<MediaContainer>'
+        '<Directory ratingKey="20495" type="artist" title="Metallica" />'
+        '</MediaContainer>'
+    )
+    artist_tracks_xml = """
+    <MediaContainer>
+      <Track title="Enter Sandman" grandparentTitle="Metallica" parentTitle="Metallica" ratingKey="s1">
+        <Media duration="330000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="One" grandparentTitle="Metallica" parentTitle="...And Justice" ratingKey="s2">
+        <Media duration="446000"><Part key="/library/parts/2/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    class FakeClient:
+        logger = None
+
+        def get_xml(self, path, params=None):
+            p = params or {}
+            if p.get("type") == "8" and "metallica" in str(p.get("title", "")).lower():
+                return artist_dir_xml
+            if p.get("artist.id") == "20495":
+                return artist_tracks_xml
+            if path == "/library/sections":
+                return sections_xml
+            return "<MediaContainer />"
+
+        def parse_tracks(self, xml_text):
+            return mod._plex_parse_tracks(self, xml_text)
+
+    items = mod._plex_search_audio(FakeClient(), "play metallica")
+
+    assert {item.creator for item in items} == {"Metallica"}
+    assert {item.title for item in items} == {"Enter Sandman", "One"}
+
+
+def test_search_audio_scores_sorts_and_caps_results():
+    """_plex_search_audio: results are scored, sorted, and capped at MAX_SEARCH_RESULTS.
+    A zero-score unrelated track does not appear when meaningful query is present."""
+    mod = load_ability_module()
+    sections_xml = '<MediaContainer><Directory key="6" title="Music" type="artist" /></MediaContainer>'
+    empty_xml = '<MediaContainer size="0" />'
+    all_tracks_xml = """
+    <MediaContainer>
+      <Track title="Enter Sandman" grandparentTitle="Metallica" parentTitle="Metallica" ratingKey="s1">
+        <Media duration="330000"><Part key="/library/parts/1/file.mp3" /></Media>
+      </Track>
+      <Track title="Unrelated" grandparentTitle="Someone Else" parentTitle="Other" ratingKey="s2">
+        <Media duration="200000"><Part key="/library/parts/2/file.mp3" /></Media>
+      </Track>
+    </MediaContainer>
+    """
+
+    class FakeClient:
+        logger = None
+
+        def get_xml(self, path, params=None):
+            p = params or {}
+            if path == "/library/sections":
+                return sections_xml
+            if path == "/search":
+                return empty_xml
+            # Artist directory lookup — no match
+            if p.get("type") == "8":
+                return empty_xml
+            # Title lookup — no exact title match
+            if "title" in p:
+                return empty_xml
+            # All-tracks scan
+            return all_tracks_xml
+
+        def parse_tracks(self, xml_text):
+            return mod._plex_parse_tracks(self, xml_text)
+
+    items = mod._plex_search_audio(FakeClient(), "play Metallica on plex")
+
+    titles = [item.title for item in items]
+    assert "Enter Sandman" in titles
+    # Zero-score unrelated item filtered out by the meaningful-query path.
+    assert "Unrelated" not in titles

@@ -24,11 +24,10 @@ MAX_SEARCH_RESULTS = 30
 RESUME_STATE_KEY = "plex_audio_last_audiobook"
 RESUME_END_THRESHOLD_MS = 60 * 1000
 EXIT_WORDS = {"stop", "exit", "quit", "cancel", "nevermind", "never mind", "done", "bye"}
-DEVKIT_DIAGNOSE_TIMEOUT = 25
-DEVKIT_SEARCH_TIMEOUT = 45
-DEVKIT_PLAY_TIMEOUT = 20
-DEVKIT_CONTROL_TIMEOUT = 15
-PLAYBACK_LISTEN_WINDOW_SECONDS = 5
+# The only DevKit calls left are the best-effort LED visualizer hooks, which
+# return almost immediately; keep a short timeout so a missing DevKit never
+# stalls cloud playback.
+DEVKIT_VIZ_TIMEOUT = 3
 MAX_PLAYBACK_SECONDS = 12 * 60 * 60
 STOP_WORDS = {"stop", "pause", "quit", "exit", "cancel", "enough", "done"}
 STOP_PHRASES = [
@@ -814,30 +813,6 @@ def parse_devkit_payload(output_text):
     return None
 
 
-def items_from_search_payload(payload):
-    items = []
-    for entry in (payload or {}).get("items") or []:
-        part_key = str(entry.get("part_key") or "")
-        if not part_key:
-            continue
-        try:
-            duration_ms = int(entry.get("duration_ms") or 0)
-        except (TypeError, ValueError):
-            duration_ms = 0
-        items.append(
-            PlexAudioItem(
-                str(entry.get("title") or "Untitled track"),
-                str(entry.get("creator") or "Unknown artist"),
-                str(entry.get("collection") or ""),
-                str(entry.get("media_type") or "music"),
-                part_key,
-                duration_ms,
-                str(entry.get("rating_key") or ""),
-            )
-        )
-    return items
-
-
 def describe_item(item):
     if item.media_type == "audiobook":
         if item.collection and item.collection != item.creator:
@@ -889,28 +864,17 @@ def updated_resume_state(state, elapsed_ms):
     return updated
 
 
-def plex_error_message(base_url, exc, devkit_mode=False):
+def plex_error_message(base_url, exc):
     error_text = str(exc or "").lower()
     base_text = str(base_url or "")
     if "401" in error_text or "unauthorized" in error_text:
         return "Plex rejected the token. Check the plex token API key and try again."
-    if "no_player" in error_text or "no audio player" in error_text:
-        return (
-            "Your DevKit has no audio player installed. "
-            "Install one on the DevKit with sudo apt install mpv, then try again."
-        )
-    if "devkit" in error_text:
-        return (
-            "I could not reach your DevKit to play from Plex. "
-            "Check that the DevKit is online and this Ability is synced to it as a Local Ability."
-        )
     if "timed out" in error_text or "connecttimeout" in error_text or "connection refused" in error_text:
-        if devkit_mode:
-            return "Your DevKit cannot reach the Plex server. Check that Plex is running and the plex base url points to its LAN address."
         if "192.168." in base_text or "10." in base_text or "172." in base_text or "localhost" in base_text:
             return (
                 "OpenHome cannot reach your Plex server at that local network address. "
-                "Use a local DevKit on the same network, or enable Plex Remote Access and set plex base url to a remote Plex URL."
+                "Enable Plex Remote Access and set plex base url to a remote Plex URL, "
+                "or say link my Plex account so I can stream through the cloud."
             )
         return "OpenHome cannot reach your Plex server. Check that the plex base url is online and reachable."
     return "Sorry, Plex playback did not work. Check that your Plex server URL is reachable and your token is valid."
@@ -953,33 +917,12 @@ class PlexAudioPlayerCapability(MatchingCapability):
             subnets.append(value)
         return subnets
 
-    def _resolve_client(self, base_url, token, account_token, server_name, machine_identifier):
-        logger = self.worker.editor_logging_handler
-        # Fall back to the stored account-link token when config has no token.
-        # A Plex account auth token works as both a server token (direct auth)
-        # and an account token (plex.tv resource discovery).
-        link_token = self._linked_token()
-        if not token and link_token:
-            token = link_token
-        if not account_token and link_token:
-            account_token = link_token
-
-        if base_url:
-            return PlexAudioClient(base_url, token, logger)
-
-        connection = discover_plex_tv_resource(
-            account_token,
-            server_name=server_name,
-            machine_identifier=machine_identifier,
-            preferred_subnets=self._preferred_subnets(),
-            logger=logger,
-        )
-        if connection:
-            return PlexAudioClient(connection.get("base_url"), connection.get("token") or token, logger)
-        return None
-
     async def _devkit_call(self, function_name, args, timeout):
-        """Run a devkit_functions.py function and return (payload, error_text)."""
+        """Run a devkit_functions.py LED visualizer hook and return (payload, error_text).
+
+        The only DevKit functions left are leds_viz_start/leds_viz_stop, so this
+        is strictly best-effort: agents without a DevKit simply get an error back,
+        which the viz hooks swallow."""
         if not hasattr(self.capability_worker, "send_devkit_capability_action"):
             return None, "DevKit actions are not available in this runtime."
         try:
@@ -999,191 +942,6 @@ class PlexAudioPlayerCapability(MatchingCapability):
             error = payload.get("error") or {}
             return None, f"{error.get('code', 'devkit_error')}: {error.get('message', 'unknown DevKit error')}"
         return payload.get("data") or {}, None
-
-    async def _devkit_diagnose(self, base_url, token):
-        """Returns the DevKit's diagnose report, or None when no DevKit responded."""
-        logger = self.worker.editor_logging_handler
-        for attempt in range(2):
-            data, error = await self._devkit_call(
-                "plex_diagnose", [base_url, token or ""], DEVKIT_DIAGNOSE_TIMEOUT
-            )
-            if data is not None:
-                logger.info(f"[PlexAudio] DevKit diagnose (attempt {attempt + 1}): {data}")
-                return data
-            logger.warning(f"[PlexAudio] DevKit diagnose attempt {attempt + 1} failed: {error}")
-            if attempt == 0:
-                await self.worker.session_tasks.sleep(3)
-        return None
-
-    async def _devkit_search(self, client, user_request):
-        data, error = await self._devkit_call(
-            "plex_search", [client.base_url, client.token or "", user_request], DEVKIT_SEARCH_TIMEOUT
-        )
-        if data is None:
-            raise RuntimeError(f"DevKit search failed: {error}")
-        return items_from_search_payload(data)
-
-    async def _listen_during_playback(self):
-        """Wait briefly for the user to say something; None on silence."""
-        try:
-            return await asyncio.wait_for(
-                self.capability_worker.wait_for_complete_transcription(),
-                timeout=PLAYBACK_LISTEN_WINDOW_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            return None
-        except Exception as exc:
-            self.worker.editor_logging_handler.warning(f"[PlexAudio] Playback listen failed: {exc}")
-            await self.worker.session_tasks.sleep(PLAYBACK_LISTEN_WINDOW_SECONDS)
-            return None
-
-    async def _stop_devkit_playback(self):
-        """Stop mpv on the DevKit, retrying once. Returns the final (data, error).
-
-        plex_stop is the only thing that kills the detached mpv process, so a
-        single failed call can orphan music. Retry once after a short pause; the
-        DevKit reports was_playing=false when nothing was playing, so a redundant
-        call is harmless."""
-        data, error = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
-        if data is None:
-            await self.worker.session_tasks.sleep(2)
-            data, error = await self._devkit_call("plex_stop", [], DEVKIT_CONTROL_TIMEOUT)
-        return data, error
-
-    async def _devkit_playback(self, client, item, offset_ms, allow_switch=False):
-        """Play on the DevKit and wait for finish or a spoken command.
-
-        Returns (position_ms, action, payload):
-          "ended"       — track finished naturally, status failed 3x, or watchdog expired. payload None.
-          "stopped"     — user asked to stop; playback halted. payload None.
-          "skip"        — user said next/skip (allow_switch only); playback ducked, not stopped. payload None.
-          "new_request" — user asked to play something new (allow_switch only); music keeps
-                          playing ducked, payload is the raw heard utterance.
-
-        Detection precedence when something is heard: stop > skip > new_request > ignore."""
-        data, error = await self._devkit_call(
-            "plex_play",
-            [
-                client.base_url,
-                client.token or "",
-                item.part_key,
-                str(int(offset_ms or 0)),
-                str(int(item.duration_ms or 0)),
-                item.title,
-                item.rating_key or "",
-            ],
-            DEVKIT_PLAY_TIMEOUT,
-        )
-        if data is None:
-            raise RuntimeError(f"DevKit playback failed: {error}")
-        # A successful plex_play means mpv is now running detached on the DevKit;
-        # the run() finally must stop it on any exit (including cancellation) so
-        # the orphan-mpv incident cannot recur.
-        self._devkit_playback_started = True
-
-        started = time.monotonic()
-        position_ms = int(offset_ms or 0)
-        status_failures = 0
-        stop_attempts = 0
-        last_heard_text = None
-        last_heard_at = None
-        while time.monotonic() - started < MAX_PLAYBACK_SECONDS:
-            iteration_started = time.monotonic()
-            # Platform-driven stop/pause: the runtime sets these events when the
-            # user asks to stop or pause during music mode. Same device action
-            # here (mpv is killed); callers persist audiobook positions.
-            if hasattr(self.worker, "music_mode_stop_event") and self.worker.music_mode_stop_event.is_set():
-                await self._devkit_call("plex_duck", ["10"], 5)
-                stop_data, _ = await self._stop_devkit_playback()
-                if stop_data is not None:
-                    position_ms = int(stop_data.get("position_ms") or position_ms)
-                    await self.capability_worker.speak("Okay, stopping Plex.")
-                    return position_ms, "stopped", None
-                stop_attempts += 1
-                if stop_attempts >= 3:
-                    await self.capability_worker.speak(
-                        "I can't reach the device to stop the music. You may need to restart it."
-                    )
-                    return position_ms, "stopped", None
-                await self.capability_worker.speak("I couldn't stop the player. I'll keep trying.")
-                continue
-            if hasattr(self.worker, "music_mode_pause_event") and self.worker.music_mode_pause_event.is_set():
-                await self._devkit_call("plex_duck", ["10"], 5)
-                stop_data, _ = await self._stop_devkit_playback()
-                if stop_data is not None:
-                    position_ms = int(stop_data.get("position_ms") or position_ms)
-                    await self.capability_worker.speak("Okay, pausing Plex.")
-                    return position_ms, "stopped", None
-                stop_attempts += 1
-                if stop_attempts >= 3:
-                    await self.capability_worker.speak(
-                        "I can't reach the device to stop the music. You may need to restart it."
-                    )
-                    return position_ms, "stopped", None
-                await self.capability_worker.speak("I couldn't stop the player. I'll keep trying.")
-                continue
-            status, status_error = await self._devkit_call("plex_status", [], DEVKIT_CONTROL_TIMEOUT)
-            if status is None:
-                status_failures += 1
-                self.worker.editor_logging_handler.warning(f"[PlexAudio] Status check failed: {status_error}")
-                if status_failures >= 3:
-                    # The DevKit is unreachable. Don't let the queue advance to the
-                    # next track on a dead device — best-effort stop and report lost.
-                    await self._stop_devkit_playback()
-                    return position_ms, "lost", None
-            else:
-                status_failures = 0
-                position_ms = int(status.get("position_ms") or position_ms)
-                if not status.get("playing"):
-                    return position_ms, "ended", None
-            listen_started = time.monotonic()
-            heard = await self._listen_during_playback()
-            # A hot listen loop: wait_for_complete_transcription has been observed
-            # returning instantly/empty (~1 poll/second), which would make the
-            # ability deaf. Throttle so instant-empty results can't spin.
-            if not normalize_text(heard) and (time.monotonic() - listen_started) < 1:
-                await self.worker.session_tasks.sleep(2)
-            # Stale-transcription dedupe: the same non-empty utterance has been
-            # observed re-returning on back-to-back polls (instant, non-empty),
-            # bypassing the empty-result throttle. Treat a recent repeat as
-            # silence so one utterance fires a command at most once.
-            now = time.monotonic()
-            if is_stale_repeat(heard, last_heard_text, last_heard_at, now):
-                heard = None
-            elif normalize_text(heard):
-                last_heard_text = heard
-                last_heard_at = now
-            if heard:
-                if playback_stop_requested(heard):
-                    await self._devkit_call("plex_duck", ["10"], 5)
-                    stop_data, _ = await self._stop_devkit_playback()
-                    if stop_data is not None:
-                        position_ms = int(stop_data.get("position_ms") or position_ms)
-                        await self.capability_worker.speak("Okay, stopping Plex.")
-                        return position_ms, "stopped", None
-                    stop_attempts += 1
-                    if stop_attempts >= 3:
-                        await self.capability_worker.speak(
-                            "I can't reach the device to stop the music. You may need to restart it."
-                        )
-                        return position_ms, "stopped", None
-                    await self.capability_worker.speak("I couldn't stop the player. I'll keep trying.")
-                    continue
-                if allow_switch and playback_skip_requested(heard):
-                    await self._devkit_call("plex_duck", ["10"], 5)
-                    await self.capability_worker.speak("Okay, next.")
-                    return position_ms, "skip", None
-                if allow_switch and playback_new_request(heard):
-                    await self._devkit_call("plex_duck", ["20"], 5)
-                    return position_ms, "new_request", heard
-            # Minimum cycle time: a complete status+listen iteration that took
-            # under 2 seconds (e.g. instant status + instant non-empty listen)
-            # would hot-loop, so sleep the remainder before the next iteration.
-            iteration_elapsed = time.monotonic() - iteration_started
-            if iteration_elapsed < 2:
-                await self.worker.session_tasks.sleep(2 - iteration_elapsed)
-        await self._stop_devkit_playback()
-        return position_ms, "ended", None
 
     async def _get_initial_request(self):
         try:
@@ -1284,11 +1042,13 @@ class PlexAudioPlayerCapability(MatchingCapability):
             await self.capability_worker.send_data_over_websocket("music-mode", {"mode": "on"})
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Music mode signal failed: {exc}")
-        # Best-effort: start the audio-reactive LED visualizer. Both cloud and
-        # LAN playback exit through the same PulseAudio sink, so the visualizer
-        # reads its monitor either way. Never let a failure here break playback.
+        # Best-effort: start the audio-reactive LED visualizer on a synced DevKit.
+        # Cloud playback exits through the device's PulseAudio sink, so the
+        # visualizer reads that monitor and pulses the LED ring in time with the
+        # music. Agents without a DevKit just get an error back here, which we
+        # swallow — it must never break playback.
         try:
-            await self._devkit_call("leds_viz_start", [], 5)
+            await self._devkit_call("leds_viz_start", [], DEVKIT_VIZ_TIMEOUT)
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] LED visualizer start failed: {exc}")
 
@@ -1297,7 +1057,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
         # Best-effort: stop the LED visualizer so the platform can reclaim the
         # strip. Never let a failure here break music-mode teardown.
         try:
-            await self._devkit_call("leds_viz_stop", [], 5)
+            await self._devkit_call("leds_viz_stop", [], DEVKIT_VIZ_TIMEOUT)
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] LED visualizer stop failed: {exc}")
         try:
@@ -1372,31 +1132,6 @@ class PlexAudioPlayerCapability(MatchingCapability):
         await self.capability_worker.speak(
             "That code expired before it was entered. Say \"link my Plex account\" to try again."
         )
-
-    async def _remote_fallback_client(self, account_token, server_name, machine_identifier, current_client):
-        """Try Plex.tv resource discovery for a remote-access endpoint.
-
-        Returns a new PlexAudioClient built from the remote connection, or None
-        if no account token is available or discovery finds nothing usable.
-        """
-        remote_token = account_token or self._linked_token()
-        if not remote_token:
-            return None
-        remote_connection = discover_plex_tv_resource(
-            remote_token,
-            server_name=server_name,
-            machine_identifier=machine_identifier,
-            preferred_subnets=None,
-            logger=self.worker.editor_logging_handler,
-            prefer_remote=True,
-        )
-        if remote_connection and remote_connection.get("base_url"):
-            return PlexAudioClient(
-                remote_connection.get("base_url"),
-                remote_connection.get("token") or current_client.token,
-                self.worker.editor_logging_handler,
-            )
-        return None
 
     def _cloud_reachable_client(self, base_url, token, account_token, server_name, machine_identifier):
         """Find a Plex connection the OpenHome cloud runtime can reach directly.
@@ -1669,11 +1404,6 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
     async def run(self):
         base_url = ""
-        devkit_mode = False
-        cloud_mode = False
-        # Reset per-session so a reused capability instance never thinks a prior
-        # session's playback is still active.
-        self._devkit_playback_started = False
         try:
             base_url, token, account_token, server_name, machine_identifier, missing = self._get_required_config()
             if missing:
@@ -1682,100 +1412,38 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 )
                 return
 
-            client = self._resolve_client(base_url, token, account_token, server_name, machine_identifier)
+            # Cloud-only playback: the OpenHome cloud streams audio straight from
+            # Plex, so it needs a route the cloud can actually reach. A Plex
+            # account auth token doubles as both a server token (direct auth) and
+            # an account token (plex.tv resource discovery), so fall back to the
+            # stored link token when config left either blank.
+            link_token = self._linked_token()
+            if not token and link_token:
+                token = link_token
+            if not account_token and link_token:
+                account_token = link_token
+
+            # Resolve a cloud-reachable Plex connection: a non-local configured
+            # base_url is probed as-is, otherwise discover a Remote Access
+            # endpoint via the account/link token. No DevKit, no LAN playback.
+            client = self._cloud_reachable_client(
+                base_url, token, account_token, server_name, machine_identifier
+            )
             if not client:
-                await self.capability_worker.speak(
-                    "I could not find your Plex server. Add plex base url, or add a Plex account token and server name for discovery."
-                )
+                if not account_token:
+                    await self.capability_worker.speak(
+                        "I don't have a way to reach your Plex server from the cloud yet. "
+                        "Say link my Plex account, and I'll walk you through it."
+                    )
+                else:
+                    await self.capability_worker.speak(
+                        "I couldn't reach your Plex server from the cloud. "
+                        "Check that Remote Access is enabled on your Plex server and shows green, then try again."
+                    )
                 return
             base_url = client.base_url
-            _link_guidance = (
-                " If Plex remote access is enabled, say link my Plex account, "
-                "and I can stream from outside your network when the local connection is down."
-            )
-
-            # Preferred path (cloud-primary): now that account linking works out of
-            # the box, stream from Plex through the OpenHome cloud whenever the cloud
-            # runtime can reach the server (a non-local base_url, or a Remote Access
-            # connection discovered via the linked account). Selecting cloud mode
-            # skips the ~25s DevKit diagnose entirely. The LAN/DevKit path is the
-            # automatic backup (and the primary when no account is linked).
-            account_token_effective = account_token or self._linked_token()
-            if account_token_effective:
-                cloud_client = self._cloud_reachable_client(
-                    base_url, client.token, account_token_effective, server_name, machine_identifier
-                )
-                if cloud_client:
-                    client = cloud_client
-                    base_url = client.base_url
-                    cloud_mode = True
-                    devkit_mode = False
-
-            # Backup path: the DevKit reaches Plex over the LAN and plays locally,
-            # so the cloud runtime never needs a route to the Plex server. Only run
-            # the (slow) DevKit diagnose when cloud-primary was not selected.
-            devkit_info = None if cloud_mode else await self._devkit_diagnose(client.base_url, client.token)
-            if cloud_mode:
-                pass
-            elif devkit_info is None:
-                if _url_is_local(client.base_url):
-                    # The DevKit is down and the only known Plex address is on the
-                    # LAN, which the cloud runtime cannot reach. Before giving up,
-                    # try Plex.tv resource discovery for a remote-access endpoint.
-                    remote_client = await self._remote_fallback_client(
-                        account_token, server_name, machine_identifier, client
-                    )
-                    if remote_client:
-                        client = remote_client
-                        base_url = client.base_url
-                        devkit_mode = False
-                        await self.capability_worker.speak(
-                            "Your OpenHome device is not reachable, so I'll stream from Plex remote access instead."
-                        )
-                    else:
-                        await self.capability_worker.speak(
-                            "I could not connect to the OpenHome device to reach your Plex server. "
-                            "Make sure the device is powered on and the Plex Audio ability is synced to it, then try again."
-                            + _link_guidance
-                        )
-                        return
-                else:
-                    devkit_mode = False
-            elif not devkit_info.get("plex_reachable"):
-                # DevKit is up but cannot reach Plex locally. Try remote access
-                # before giving up.
-                remote_client = await self._remote_fallback_client(
-                    account_token, server_name, machine_identifier, client
-                )
-                if remote_client:
-                    client = remote_client
-                    base_url = client.base_url
-                    devkit_mode = False
-                    await self.capability_worker.speak(
-                        "Your OpenHome device cannot reach Plex on your local network, "
-                        "so I'll stream from Plex remote access instead."
-                    )
-                else:
-                    await self.capability_worker.speak(
-                        "Your OpenHome device is online, but it cannot reach the Plex server at the configured address. "
-                        "Check that Plex is running and that plex base url is the server's local network address, like its LAN IP and port 32400."
-                        + _link_guidance
-                    )
-                    return
-            elif not devkit_info.get("player"):
-                await self.capability_worker.speak(
-                    "Your OpenHome device can reach Plex, but it has no audio player installed. "
-                    "On the device, run sudo apt install mpv, then ask me again."
-                )
-                return
-            else:
-                devkit_mode = True
 
             user_request = await self._get_initial_request()
-            # Duck any in-progress music (possibly from an orphaned earlier
-            # session) so every spoken response below is audible over it. It's a
-            # no-op on the DevKit when nothing is playing.
-            await self._devkit_call("plex_duck", ["20"], 5)
             if not user_request or exit_requested(user_request):
                 await self.capability_worker.speak("Okay, I will leave Plex closed.")
                 return
@@ -1784,21 +1452,12 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 await self._link_plex_account()
                 return
 
-            # Fresh-session stop kill-switch: a "stop the music" request landing in
-            # a brand-new session (no capability attached to the orphaned playback)
-            # must still kill mpv on the DevKit, rather than letting the default
-            # agent falsely claim it stopped.
+            # Fresh-session stop kill-switch: cloud playback dies with its session,
+            # so a "stop the music" request landing in a brand-new session has
+            # nothing to kill — but keep the branch so the request gets a sane
+            # response instead of being treated as a search.
             if playback_stop_requested(user_request):
-                await self._devkit_call("plex_duck", ["10"], 5)
-                stop_data, _ = await self._stop_devkit_playback()
-                if stop_data is None:
-                    await self.capability_worker.speak(
-                        "I couldn't reach the OpenHome device to stop the music. Check that it's powered on."
-                    )
-                elif stop_data.get("was_playing"):
-                    await self.capability_worker.speak("Okay, Plex is stopped.")
-                else:
-                    await self.capability_worker.speak("Nothing is playing from Plex right now.")
+                await self.capability_worker.speak("Nothing is playing from Plex right now.")
                 return
 
             # STT sometimes finalizes early, leaving only a wake/command artifact
@@ -1829,119 +1488,46 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 offset_ms = int(resume_state.get("offset_ms") or 0)
                 await self.capability_worker.speak(f"Resuming {describe_item(choice)} from Plex.")
                 self._write_resume_state(build_resume_state(choice, offset_ms))
-                if devkit_mode:
-                    await self._music_mode_on()
-                    final_position_ms, _, _ = await self._devkit_playback(client, choice, offset_ms)
-                    elapsed_ms = max(0, final_position_ms - offset_ms)
-                else:
-                    elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
+                elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
                 current_state = self._read_resume_state() or build_resume_state(choice, offset_ms)
                 self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
                 return
 
             # --- New search ---
-            # (Music was already ducked right after the initial request.)
             await self.capability_worker.speak("Searching your Plex audio libraries.")
-            if devkit_mode:
-                items = await self._devkit_search(client, user_request)
-            else:
-                items = client.search_audio(user_request)
+            items = client.search_audio(user_request)
 
             choice = choose_best_item(items, user_request)
             if not choice:
                 await self.capability_worker.speak(
                     "I could not find matching music or audiobooks in Plex. Try a title, artist, album, or book name."
                 )
-                await self._devkit_call("plex_duck", ["100"], 5)
                 return
 
             # --- Audiobook: single track with resume state ---
             if choice.media_type == "audiobook":
                 await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
                 self._write_resume_state(build_resume_state(choice, 0))
-                if devkit_mode:
-                    await self._music_mode_on()
-                    final_position_ms, _, _ = await self._devkit_playback(client, choice, 0)
-                    elapsed_ms = max(0, final_position_ms)
-                else:
-                    elapsed_ms = await self._stream_audio(client.stream_url_for(choice))
+                elapsed_ms = await self._stream_audio(client.stream_url_for(choice))
                 current_state = self._read_resume_state() or build_resume_state(choice, 0)
                 self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
                 return
 
             # --- Music: build a queue from all matching results, play in order ---
-            # items is already sorted by relevance score (best first from _devkit_search /
-            # search_plex_audio). Prefer the same artist, else wrap to include lower-ranked tracks.
+            # items is already sorted by relevance score (best first from
+            # search_audio). Prefer the same artist, else wrap to include
+            # lower-ranked tracks.
             queue = build_music_queue(items, choice)
-            i = 0
-            offset = 0
             await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
-            # Cloud-primary path: continuous queue playback with voice stop/skip
-            # and mid-song switching, matching the DevKit feature set.
-            if cloud_mode:
-                await self._stream_queue(client, queue, user_request)
-                return
-            if devkit_mode:
-                await self._music_mode_on()
-            while i < len(queue):
-                if not devkit_mode:
-                    # Non-cloud, non-devkit fallback (rare remote-access streaming
-                    # without an account link): single-track playback, no end
-                    # detection in this branch.
-                    await self._stream_audio(client.stream_url_for(queue[i]))
-                    return
-                position_ms, action, payload = await self._devkit_playback(
-                    client, queue[i], offset, allow_switch=True
-                )
-                if action == "stopped":
-                    return
-                if action == "lost":
-                    await self.capability_worker.speak(
-                        "I lost contact with the OpenHome device, so I'm stopping Plex playback."
-                    )
-                    return
-                if action == "skip":
-                    i += 1
-                    offset = 0
-                    continue
-                if action == "new_request":
-                    new_items = await self._devkit_search(client, payload)
-                    new_choice = choose_best_item(new_items, payload)
-                    if new_choice:
-                        await self.capability_worker.speak(f"Playing {describe_item(new_choice)} from Plex.")
-                        queue = build_music_queue(new_items, new_choice)
-                        i = 0
-                        offset = 0
-                        continue
-                    await self.capability_worker.speak("I couldn't find that. Continuing the music.")
-                    offset = position_ms  # resume current track where it was
-                    continue  # same i — plex_play restarts the track at offset, full volume
-                # action == "ended"
-                i += 1
-                offset = 0
-
-            # Queue exhausted. If the last action was a skip, mpv is still playing ducked — stop it.
-            await self._stop_devkit_playback()
+            # Continuous queue playback through the cloud with voice stop/skip and
+            # mid-song switching.
+            await self._stream_queue(client, queue, user_request)
 
         except Exception as exc:
             self.worker.editor_logging_handler.error(f"[PlexAudio] Error: {exc}")
-            await self.capability_worker.speak(plex_error_message(base_url, exc, devkit_mode))
-            # If we ducked in-progress music but never started new playback, restore its volume.
-            await self._devkit_call("plex_duck", ["100"], 5)
+            await self.capability_worker.speak(plex_error_message(base_url, exc))
         finally:
-            # Never orphan mpv: if a DevKit playback was started, stop it before
-            # tearing down music mode. This runs even on asyncio.CancelledError
-            # (which the except above does NOT catch), which is the one path that
-            # left mpv playing for minutes in the incident. Guard so finally can
-            # never raise while the session is tearing down.
-            # _devkit_playback_started is always initialized at the top of run()
-            # (the platform sandbox forbids getattr).
-            if devkit_mode and self._devkit_playback_started:
-                try:
-                    await self._stop_devkit_playback()
-                except Exception as exc:
-                    self.worker.editor_logging_handler.warning(
-                        f"[PlexAudio] Teardown stop failed: {exc}"
-                    )
+            # Stop the LED visualizer and tear down music mode, then hand control
+            # back to the Personality. Guarded so teardown can never raise.
             await self._music_mode_off()
             self.capability_worker.resume_normal_flow()
