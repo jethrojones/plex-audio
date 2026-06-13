@@ -17,6 +17,8 @@ PLEX_SERVER_NAME_KEY = "plex_server_name"
 PLEX_MACHINE_IDENTIFIER_KEY = "plex_machine_identifier"
 PLEX_CLIENT_ID = "openhome-plexaudio-cloud"
 PLEX_LINK_STATE_KEY = "plex_audio_account_link"
+PLEX_LINK_FILE = "plex_audio_link.json"
+PLEX_RESUME_FILE = "plex_audio_resume.json"
 REQUEST_TIMEOUT = 15
 STREAM_CHUNK_SIZE = 64 * 1024
 AUDIO_SEARCH_TYPE = "10"
@@ -404,7 +406,11 @@ def discover_plex_tv_resource(account_token, server_name=None, machine_identifie
         return None
     try:
         url = "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&X-Plex-Token=" + _url_quote(token)
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        headers = {
+            "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
+            "X-Plex-Product": "OpenHome PlexAudio",
+        }
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return parse_plex_tv_resources(response.text, server_name, machine_identifier, preferred_subnets, prefer_remote)
     except Exception as exc:
@@ -652,14 +658,22 @@ def exit_requested(user_text):
 def link_requested(user_text):
     """True when the user is asking to link/connect their Plex account.
 
-    Requires the word "plex" plus an explicit account/auth verb so ordinary
-    play requests ("play metallica from plex") never trigger linking."""
+    Accepts either:
+    - "plex" (or known STT garbles like "platt") + link/auth verb, OR
+    - "account" (without a competing service like "spotify") + link/auth verb.
+
+    The dual signal handles STT garbling of "Plex" while preventing false
+    matches on "link my spotify account" etc."""
     text = normalize_text(user_text)
-    if "plex" not in text:
+    plex_signals = ["plex", "platt", "placks"]
+    other_services = ["spotify", "apple music", "amazon", "tidal", "deezer", "youtube"]
+    has_plex = any(s in text for s in plex_signals)
+    has_account = "account" in text and not any(s in text for s in other_services)
+    if not has_plex and not has_account:
         return False
     link_terms = [
         "link", "sign in", "log in", "login", "connect",
-        "authenticate", "authorize", "account",
+        "authenticate", "authorize",
     ]
     return any(term in text for term in link_terms)
 
@@ -983,46 +997,44 @@ class PlexAudioPlayerCapability(MatchingCapability):
             if hasattr(self.worker, "music_mode_event"):
                 self.worker.music_mode_event.clear()
 
-    def _read_resume_state(self):
+    async def _read_resume_state(self):
         try:
-            return self.capability_worker.get_single_key(RESUME_STATE_KEY)
+            if not await self.capability_worker.check_if_file_exists(PLEX_RESUME_FILE, in_ability_directory=False):
+                return None
+            data = await self.capability_worker.read_file(PLEX_RESUME_FILE, in_ability_directory=False)
+            return json.loads(data) if data else None
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Resume read failed: {exc}")
             return None
 
-    def _write_resume_state(self, state):
+    async def _write_resume_state(self, state):
         if not state:
             return
         try:
-            existing = self.capability_worker.get_single_key(RESUME_STATE_KEY)
-            if existing:
-                self.capability_worker.update_key(RESUME_STATE_KEY, state)
-            else:
-                self.capability_worker.create_key(RESUME_STATE_KEY, state)
+            await self.capability_worker.write_file(PLEX_RESUME_FILE, json.dumps(state), in_ability_directory=False)
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Resume save failed: {exc}")
 
-    def _read_link_state(self):
+    async def _read_link_state(self):
         try:
-            return self.capability_worker.get_single_key(PLEX_LINK_STATE_KEY)
+            if not await self.capability_worker.check_if_file_exists(PLEX_LINK_FILE, in_ability_directory=False):
+                return None
+            data = await self.capability_worker.read_file(PLEX_LINK_FILE, in_ability_directory=False)
+            return json.loads(data) if data else None
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Link read failed: {exc}")
             return None
 
-    def _write_link_state(self, state):
+    async def _write_link_state(self, state):
         if not state:
             return
         try:
-            existing = self.capability_worker.get_single_key(PLEX_LINK_STATE_KEY)
-            if existing:
-                self.capability_worker.update_key(PLEX_LINK_STATE_KEY, state)
-            else:
-                self.capability_worker.create_key(PLEX_LINK_STATE_KEY, state)
+            await self.capability_worker.write_file(PLEX_LINK_FILE, json.dumps(state), in_ability_directory=False)
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Link save failed: {exc}")
 
-    def _linked_token(self):
-        state = self._read_link_state()
+    async def _linked_token(self):
+        state = await self._read_link_state()
         if isinstance(state, dict):
             return str(state.get("token") or "").strip()
         return ""
@@ -1123,7 +1135,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 logger.warning(f"[PlexAudio] Plex PIN poll failed: {exc}")
                 continue
             if auth_token:
-                self._write_link_state({"token": auth_token, "linked_at": time.time()})
+                await self._write_link_state({"token": auth_token, "linked_at": time.time()})
                 await self.capability_worker.speak(
                     "Your Plex account is linked. You can now ask me to play music or audiobooks."
                 )
@@ -1406,22 +1418,34 @@ class PlexAudioPlayerCapability(MatchingCapability):
         base_url = ""
         try:
             base_url, token, account_token, server_name, machine_identifier, missing = self._get_required_config()
-            if missing:
-                await self.capability_worker.speak(
-                    "Plex Audio Player needs setup first. Add a Plex base URL, or add a Plex account token for discovery."
-                )
-                return
 
             # Cloud-only playback: the OpenHome cloud streams audio straight from
             # Plex, so it needs a route the cloud can actually reach. A Plex
             # account auth token doubles as both a server token (direct auth) and
             # an account token (plex.tv resource discovery), so fall back to the
             # stored link token when config left either blank.
-            link_token = self._linked_token()
+            link_token = await self._linked_token()
             if not token and link_token:
                 token = link_token
             if not account_token and link_token:
                 account_token = link_token
+
+            # Read the initial request BEFORE connecting so "link my Plex account"
+            # works even when no server is reachable yet (no token stored yet).
+            user_request = await self._get_initial_request()
+            if not user_request or exit_requested(user_request):
+                await self.capability_worker.speak("Okay, I will leave Plex closed.")
+                return
+
+            if link_requested(user_request):
+                await self._link_plex_account()
+                return
+
+            if missing:
+                await self.capability_worker.speak(
+                    "Plex Audio Player needs setup first. Add a Plex base URL, or add a Plex account token for discovery."
+                )
+                return
 
             # Resolve a cloud-reachable Plex connection: a non-local configured
             # base_url is probed as-is, otherwise discover a Remote Access
@@ -1442,15 +1466,6 @@ class PlexAudioPlayerCapability(MatchingCapability):
                     )
                 return
             base_url = client.base_url
-
-            user_request = await self._get_initial_request()
-            if not user_request or exit_requested(user_request):
-                await self.capability_worker.speak("Okay, I will leave Plex closed.")
-                return
-
-            if link_requested(user_request):
-                await self._link_plex_account()
-                return
 
             # Fresh-session stop kill-switch: cloud playback dies with its session,
             # so a "stop the music" request landing in a brand-new session has
@@ -1478,7 +1493,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
 
             # --- Resume audiobook ---
             if resume_requested(user_request):
-                resume_state = self._read_resume_state()
+                resume_state = await self._read_resume_state()
                 choice = item_from_resume_state(resume_state)
                 if not choice:
                     await self.capability_worker.speak(
@@ -1487,10 +1502,10 @@ class PlexAudioPlayerCapability(MatchingCapability):
                     return
                 offset_ms = int(resume_state.get("offset_ms") or 0)
                 await self.capability_worker.speak(f"Resuming {describe_item(choice)} from Plex.")
-                self._write_resume_state(build_resume_state(choice, offset_ms))
+                await self._write_resume_state(build_resume_state(choice, offset_ms))
                 elapsed_ms = await self._stream_audio(client.stream_url_for(choice, offset_ms=offset_ms))
-                current_state = self._read_resume_state() or build_resume_state(choice, offset_ms)
-                self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
+                current_state = (await self._read_resume_state()) or build_resume_state(choice, offset_ms)
+                await self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
                 return
 
             # --- New search ---
@@ -1507,10 +1522,10 @@ class PlexAudioPlayerCapability(MatchingCapability):
             # --- Audiobook: single track with resume state ---
             if choice.media_type == "audiobook":
                 await self.capability_worker.speak(f"Playing {describe_item(choice)} from Plex.")
-                self._write_resume_state(build_resume_state(choice, 0))
+                await self._write_resume_state(build_resume_state(choice, 0))
                 elapsed_ms = await self._stream_audio(client.stream_url_for(choice))
-                current_state = self._read_resume_state() or build_resume_state(choice, 0)
-                self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
+                current_state = (await self._read_resume_state()) or build_resume_state(choice, 0)
+                await self._write_resume_state(updated_resume_state(current_state, elapsed_ms))
                 return
 
             # --- Music: build a queue from all matching results, play in order ---
