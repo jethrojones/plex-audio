@@ -36,3 +36,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Session memory (migrated to the Obsidian vault)
+session-memory
