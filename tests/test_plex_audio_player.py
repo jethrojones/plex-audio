@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import sys
@@ -41,6 +42,13 @@ def load_ability_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_config_includes_exact_common_plex_trigger():
+    config_path = Path(__file__).resolve().parents[1] / "community" / "plex-audio-player" / "config.json"
+    config = json.loads(config_path.read_text())
+
+    assert "play music from my Plex" in config["trigger_words"]
 
 
 def test_plex_url_adds_token_and_params():
@@ -279,68 +287,128 @@ def test_plex_url_omits_token_when_blank_for_lan_no_auth():
     assert url == "http://plex.local:32400/library/sections?type=10"
 
 
+# Fixtures below mirror the REAL plex.tv /api/v2/resources response shape:
+# lowercase <resources>/<resource>/<connections>/<connection> elements.
+# (The original fixtures used the legacy v1 <Device>/<Connection> shape, which
+# matched the code but not the live API — that's how the parse bug shipped.)
+# All tokens, plex.direct hashes, and machine identifiers here are FAKE.
+
 def test_parse_plex_tv_resources_prefers_matching_local_connection():
     mod = load_ability_module()
     xml = """
-    <MediaContainer>
-      <Device name="ombee" clientIdentifier="acdc" accessToken="server-token">
-        <Connection uri="http://192.168.0.20:32400" local="1" />
-        <Connection uri="http://10.0.0.136:32400" local="1" />
-        <Connection uri="https://76-121-135-187.example.plex.direct:32400" local="0" />
-      </Device>
-    </MediaContainer>
+    <resources>
+      <resource name="ombee" clientIdentifier="fake0123456789abcdef0123456789abcdef0123" accessToken="fake-server-token" provides="server" publicAddress="203.0.113.10">
+        <connections>
+          <connection uri="http://192.168.0.20:32400" address="192.168.0.20" port="32400" protocol="http" local="1" relay="0" />
+          <connection uri="http://10.0.0.136:32400" address="10.0.0.136" port="32400" protocol="http" local="1" relay="0" />
+          <connection uri="https://203-0-113-10.fakehash1234567890abcdef.plex.direct:32400" address="203.0.113.10" port="32400" protocol="https" local="0" relay="0" />
+        </connections>
+      </resource>
+    </resources>
     """
 
     connection = mod.parse_plex_tv_resources(xml, server_name="ombee", preferred_subnets=["10."])
 
     assert connection["base_url"] == "http://10.0.0.136:32400"
-    assert connection["token"] == "server-token"
+    assert connection["token"] == "fake-server-token"
 
 
 def test_parse_plex_tv_resources_can_match_machine_identifier():
     mod = load_ability_module()
     xml = """
-    <MediaContainer>
-      <Device name="Other" clientIdentifier="wrong" accessToken="wrong-token">
-        <Connection uri="http://10.0.0.2:32400" local="1" />
-      </Device>
-      <Device name="ombee" clientIdentifier="acdc74e9" accessToken="right-token">
-        <Connection uri="http://10.0.0.136:32400" local="1" />
-      </Device>
-    </MediaContainer>
+    <resources>
+      <resource name="Other" clientIdentifier="fakewrongidentifier" accessToken="fake-wrong-token" provides="server">
+        <connections>
+          <connection uri="http://10.0.0.2:32400" local="1" relay="0" />
+        </connections>
+      </resource>
+      <resource name="ombee" clientIdentifier="fake0123456789abcdef" accessToken="fake-right-token" provides="server">
+        <connections>
+          <connection uri="http://10.0.0.136:32400" local="1" relay="0" />
+        </connections>
+      </resource>
+    </resources>
     """
 
-    connection = mod.parse_plex_tv_resources(xml, machine_identifier="acdc74e9")
+    connection = mod.parse_plex_tv_resources(xml, machine_identifier="fake0123456789abcdef")
 
     assert connection["base_url"] == "http://10.0.0.136:32400"
-    assert connection["token"] == "right-token"
+    assert connection["token"] == "fake-right-token"
 
 
-def test_parse_remote_plex_connections_returns_direct_before_relay_and_skips_local():
+def test_parse_plex_connections_skips_non_server_resources():
     mod = load_ability_module()
     xml = """
-    <MediaContainer>
-      <Device name="ombee" clientIdentifier="acdc" accessToken="server-token">
-        <Connection uri="http://10.0.0.136:32400" local="1" relay="0" />
-        <Connection uri="https://76-121-135-187.example.plex.direct:32400" local="0" relay="0" />
-        <Connection uri="https://relay-abc.example.plex.direct:443" local="0" relay="1" />
-      </Device>
-    </MediaContainer>
+    <resources>
+      <resource name="Some Player" clientIdentifier="fakeplayerid" accessToken="fake-player-token" provides="player">
+        <connections>
+          <connection uri="http://10.0.0.50:32500" local="1" relay="0" />
+        </connections>
+      </resource>
+      <resource name="ombee" clientIdentifier="fakeserverid" accessToken="fake-server-token" provides="server">
+        <connections>
+          <connection uri="http://10.0.0.136:32400" local="1" relay="0" />
+        </connections>
+      </resource>
+    </resources>
+    """
+
+    connections = mod._parse_plex_connections(xml)
+
+    assert len(connections) == 1
+    assert connections[0]["name"] == "ombee"
+
+
+def test_parse_remote_plex_connections_returns_relay_before_direct_and_skips_local():
+    mod = load_ability_module()
+    xml = """
+    <resources>
+      <resource name="ombee" clientIdentifier="fake0123456789abcdef" accessToken="fake-server-token" provides="server">
+        <connections>
+          <connection uri="http://10.0.0.136:32400" local="1" relay="0" />
+          <connection uri="https://203-0-113-10.fakehash1234567890abcdef.plex.direct:32400" local="0" relay="0" />
+          <connection uri="https://198-51-100-20.fakehash1234567890abcdef.plex.direct:8443" local="0" relay="1" />
+        </connections>
+      </resource>
+    </resources>
     """
 
     remote = mod.parse_remote_plex_connections(xml)
 
-    # Only the two non-local connections, with the direct endpoint first.
+    # Only the two non-local connections, with the relay endpoint first so cloud
+    # playback uses the relay path before trying residential-port direct access.
     assert len(remote) == 2
-    assert remote[0]["base_url"] == "https://76-121-135-187.example.plex.direct:32400"
-    assert remote[0]["relay"] is False
-    assert remote[1]["base_url"] == "https://relay-abc.example.plex.direct:443"
-    assert remote[1]["relay"] is True
+    assert remote[0]["base_url"] == "https://198-51-100-20.fakehash1234567890abcdef.plex.direct:8443"
+    assert remote[0]["relay"] is True
+    assert remote[1]["base_url"] == "https://203-0-113-10.fakehash1234567890abcdef.plex.direct:32400"
+    assert remote[1]["relay"] is False
     # The local connection is excluded.
     assert all(conn["base_url"] != "http://10.0.0.136:32400" for conn in remote)
 
 
-def test_remote_plex_connections_orders_direct_before_relay():
+def test_parse_plex_connections_falls_back_to_legacy_device_format():
+    # Legacy v1-style <Device>/<Connection> responses must still parse.
+    mod = load_ability_module()
+    xml = """
+    <MediaContainer>
+      <Device name="ombee" clientIdentifier="fake0123456789abcdef" accessToken="fake-server-token" provides="server">
+        <Connection uri="http://10.0.0.136:32400" local="1" relay="0" />
+        <Connection uri="https://198-51-100-20.fakehash1234567890abcdef.plex.direct:8443" local="0" relay="1" />
+      </Device>
+    </MediaContainer>
+    """
+
+    connections = mod._parse_plex_connections(xml, server_name="ombee")
+
+    assert len(connections) == 2
+    assert connections[0]["token"] == "fake-server-token"
+    assert connections[0]["machine_identifier"] == "fake0123456789abcdef"
+    remote = mod.remote_plex_connections(connections)
+    assert len(remote) == 1
+    assert remote[0]["relay"] is True
+
+
+def test_remote_plex_connections_orders_relay_before_direct():
     mod = load_ability_module()
     connections = [
         {"base_url": "https://relay.example.plex.direct:443", "local": False, "relay": True, "token": "tok"},
@@ -351,8 +419,8 @@ def test_remote_plex_connections_orders_direct_before_relay():
     remote = mod.remote_plex_connections(connections)
 
     assert [conn["base_url"] for conn in remote] == [
-        "https://direct.example.plex.direct:32400",
         "https://relay.example.plex.direct:443",
+        "https://direct.example.plex.direct:32400",
     ]
 
 
@@ -857,6 +925,15 @@ class _FakeLogger:
 class _FakeWorker:
     def __init__(self):
         self.editor_logging_handler = _FakeLogger()
+        self.session_tasks = _FakeSessionTasks()
+
+
+class _FakeSessionTasks:
+    async def sleep(self, seconds):
+        return None
+
+    def create(self, coroutine):
+        return asyncio.create_task(coroutine)
 
 
 def _make_capability(mod):
@@ -865,6 +942,232 @@ def _make_capability(mod):
     cap.worker = _FakeWorker()
     cap.capability_worker = None
     return cap
+
+
+class _FakeLinkStorageWorker:
+    def __init__(self, keys=None, file_text=None, persist_keys=True, persist_files=True):
+        self.keys = dict(keys or {})
+        self.file_text = file_text
+        self.persist_keys = persist_keys
+        self.persist_files = persist_files
+        self.created = []
+        self.updated = []
+        self.file_writes = []
+        self.spoken = []
+        self.resumed = False
+
+    def get_single_key(self, key):
+        return self.keys.get(key)
+
+    def create_key(self, key, value):
+        self.created.append((key, value))
+        if self.persist_keys:
+            self.keys[key] = value
+
+    def update_key(self, key, value):
+        self.updated.append((key, value))
+        if self.persist_keys:
+            self.keys[key] = value
+
+    async def check_if_file_exists(self, filename, in_ability_directory=False):
+        return self.file_text is not None
+
+    async def read_file(self, filename, in_ability_directory=False):
+        return self.file_text
+
+    async def write_file(self, filename, content, in_ability_directory=False, mode=None):
+        self.file_writes.append(
+            {
+                "filename": filename,
+                "content": content,
+                "in_ability_directory": in_ability_directory,
+                "mode": mode,
+            }
+        )
+        if mode == "w" or self.file_text is None:
+            if self.persist_files:
+                self.file_text = content
+        else:
+            if self.persist_files:
+                self.file_text += content
+
+    async def speak(self, text):
+        self.spoken.append(text)
+
+    def resume_normal_flow(self):
+        self.resumed = True
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class _FakeFileOnlyStorageWorker:
+    def __init__(self):
+        self.file_text = None
+        self.file_writes = []
+
+    async def check_if_file_exists(self, filename, in_ability_directory=False):
+        return self.file_text is not None
+
+    async def read_file(self, filename, in_ability_directory=False):
+        return self.file_text
+
+    async def write_file(self, filename, content, in_ability_directory=False, mode=None):
+        self.file_writes.append(
+            {
+                "filename": filename,
+                "content": content,
+                "in_ability_directory": in_ability_directory,
+                "mode": mode,
+            }
+        )
+        self.file_text = content
+
+
+def test_write_link_state_uses_key_storage_and_linked_token_reads_it():
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    worker = _FakeLinkStorageWorker()
+    cap.capability_worker = worker
+
+    asyncio.run(cap._write_link_state({"token": "saved-token", "linked_at": 123}))
+
+    assert worker.created == [
+        (mod.PLEX_LINK_STATE_KEY, {"token": "saved-token", "linked_at": 123})
+    ]
+    assert asyncio.run(cap._linked_token()) == "saved-token"
+
+
+def test_write_link_state_also_writes_file_when_key_is_not_immediately_readable():
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    worker = _FakeLinkStorageWorker(persist_keys=False)
+    cap.capability_worker = worker
+
+    assert asyncio.run(cap._write_link_state({"token": "saved-token", "linked_at": 123})) is True
+
+    assert worker.created == [
+        (mod.PLEX_LINK_STATE_KEY, {"token": "saved-token", "linked_at": 123})
+    ]
+    assert worker.file_writes == [
+        {
+            "filename": mod.PLEX_LINK_FILE,
+            "content": json.dumps({"token": "saved-token", "linked_at": 123}),
+            "in_ability_directory": False,
+            "mode": "w",
+        }
+    ]
+    assert asyncio.run(cap._linked_token()) == "saved-token"
+
+
+def test_write_link_state_file_fallback_uses_overwrite_mode():
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    worker = _FakeFileOnlyStorageWorker()
+    cap.capability_worker = worker
+
+    assert asyncio.run(cap._write_link_state({"token": "file-token", "linked_at": 123})) is True
+
+    assert worker.file_writes == [
+        {
+            "filename": mod.PLEX_LINK_FILE,
+            "content": json.dumps({"token": "file-token", "linked_at": 123}),
+            "in_ability_directory": False,
+            "mode": "w",
+        }
+    ]
+    assert asyncio.run(cap._linked_token()) == "file-token"
+
+
+def test_linked_token_accepts_existing_valid_file_state_as_fallback():
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    cap.capability_worker = _FakeLinkStorageWorker(
+        file_text=json.dumps({"token": "file-token", "linked_at": 123})
+    )
+
+    assert asyncio.run(cap._linked_token()) == "file-token"
+
+
+def test_linked_token_ignores_corrupt_appended_json_file():
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    cap.capability_worker = _FakeLinkStorageWorker(
+        file_text='{"token": "old-token"}{"token": "new-token"}'
+    )
+
+    assert asyncio.run(cap._linked_token()) == ""
+
+
+def test_link_plex_account_does_not_claim_success_when_saved_token_cannot_be_read_back(monkeypatch):
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    worker = _FakeLinkStorageWorker(persist_keys=False, persist_files=False)
+    cap.capability_worker = worker
+
+    monkeypatch.setattr(mod.requests, "post", lambda *a, **k: _FakeResponse({"id": 7, "code": "ABCD"}))
+    monkeypatch.setattr(mod.requests, "get", lambda *a, **k: _FakeResponse({"authToken": "new-token"}))
+
+    asyncio.run(cap._link_plex_account())
+
+    spoken = " ".join(worker.spoken).lower()
+    assert "your plex account is linked" not in spoken
+    assert "could not be saved" in spoken
+
+
+def test_run_with_saved_link_token_plays_without_starting_link_flow(monkeypatch):
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+    worker = _FakeLinkStorageWorker(keys={mod.PLEX_LINK_STATE_KEY: {"token": "saved-token"}})
+    cap.capability_worker = worker
+
+    item = mod.PlexAudioItem("So What", "Miles Davis", "Kind of Blue", "music", "/so-what.mp3", 545000, "rk1")
+    calls = {"linked": 0, "streamed": 0}
+
+    class _FakeClient:
+        base_url = "https://plex.example:32400"
+        token = "saved-token"
+
+        def search_audio(self, user_text):
+            return [item]
+
+    async def fail_link():
+        calls["linked"] += 1
+
+    async def fake_stream_queue(client, queue, user_request):
+        calls["streamed"] += 1
+        assert client.token == "saved-token"
+        assert [queued.part_key for queued in queue] == ["/so-what.mp3"]
+        assert user_request == "play music from my Plex"
+
+    async def fake_initial_request():
+        return "play music from my Plex"
+
+    async def fake_music_mode_off():
+        return None
+
+    def fake_cloud_reachable_client(base_url, token, account_token, server_name, machine_identifier):
+        assert token == "saved-token"
+        assert account_token == "saved-token"
+        return _FakeClient()
+
+    monkeypatch.setattr(cap, "_get_initial_request", fake_initial_request)
+    monkeypatch.setattr(cap, "_link_plex_account", fail_link)
+    monkeypatch.setattr(cap, "_cloud_reachable_client", fake_cloud_reachable_client)
+    monkeypatch.setattr(cap, "_stream_queue", fake_stream_queue)
+    monkeypatch.setattr(cap, "_music_mode_off", fake_music_mode_off)
+
+    asyncio.run(cap.run())
+
+    assert calls == {"linked": 0, "streamed": 1}
 
 
 def test_new_cloud_methods_exist():
@@ -1004,6 +1307,52 @@ def test_cloud_reachable_client_uses_remote_discovery_for_local_base_url(monkeyp
     assert client is not None
     assert client.base_url == "https://1-2-3-4.example.plex.direct:32400"
     assert client.token == "remote-tok"
+
+
+def test_cloud_reachable_client_prefers_relay_connection_for_cloud_playback(monkeypatch):
+    mod = load_ability_module()
+    cap = _make_capability(mod)
+
+    monkeypatch.setattr(
+        mod,
+        "discover_plex_tv_connections",
+        lambda *a, **k: [
+            {
+                "base_url": "https://relay.example.plex.direct:443",
+                "token": "relay-tok",
+                "local": False,
+                "relay": True,
+            },
+            {
+                "base_url": "https://direct.example.plex.direct:32400",
+                "token": "direct-tok",
+                "local": False,
+                "relay": False,
+            },
+        ],
+    )
+
+    probed = []
+
+    def fake_get(url, timeout=None):
+        probed.append(url)
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+        return _Resp()
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+
+    client = cap._cloud_reachable_client(
+        "http://10.0.0.136:32400", "tok", "acct", None, None
+    )
+
+    assert client is not None
+    assert client.base_url == "https://relay.example.plex.direct:443"
+    assert client.token == "relay-tok"
+    assert "direct.example.plex.direct" not in " ".join(probed)
 
 
 def test_cloud_reachable_client_returns_none_when_probe_fails(monkeypatch):

@@ -7,6 +7,7 @@
     "play from Plex",
     "Plex music",
     "play music from Plex",
+    "play music from my Plex",
     "play on Plex",
     "play from my Plex",
     "Plex library",
@@ -17,6 +18,12 @@
     "play audiobook",
     "continue my audiobook",
     "resume my book",
-    "play music from my server"
+    "play music from my server",
+    "link my Plex account",
+    "link my Plex",
+    "link Plex",
+    "connect my Plex account",
+    "connect Plex",
+    "sign in to Plex"
   ]
 }

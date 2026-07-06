@@ -16,6 +16,7 @@ PLEX_ACCOUNT_TOKEN_KEY = "plex_account_token"
 PLEX_SERVER_NAME_KEY = "plex_server_name"
 PLEX_MACHINE_IDENTIFIER_KEY = "plex_machine_identifier"
 PLEX_CLIENT_ID = "openhome-plexaudio-cloud"
+PLEX_AUDIO_BUILD = "2026-07-06-v2-resources-parse-fix"
 PLEX_LINK_STATE_KEY = "plex_audio_account_link"
 PLEX_LINK_FILE = "plex_audio_link.json"
 PLEX_RESUME_FILE = "plex_audio_resume.json"
@@ -342,6 +343,11 @@ def _url_is_local(url):
     )
 
 
+def _connection_log_label(connection):
+    relay = "relay" if connection.get("relay") else "direct"
+    return f"{relay}:{connection.get('base_url')}"
+
+
 def _connection_matches(connection, server_name=None, machine_identifier=None):
     if server_name and str(connection.get("name") or "").lower() != str(server_name).lower():
         return False
@@ -372,20 +378,18 @@ def choose_best_plex_connection(connections, preferred_subnets=None, prefer_remo
 
 
 def remote_plex_connections(connections):
-    """All cloud-reachable (non-local) connections, direct endpoints before relay.
+    """All cloud-reachable (non-local) connections, relay endpoints before direct.
 
-    The OpenHome cloud cannot reach a LAN address. Behind double NAT a server's
-    direct remote endpoint is often unreachable too, so callers should try each
-    of these in order and fall back to the relay (slower, but works behind any
-    NAT) when the direct endpoints fail."""
+    The OpenHome cloud cannot reach a LAN address, and its outbound network path
+    is more reliable through Plex Relay's 443 endpoint than residential 32400
+    direct ports. Direct remote endpoints remain a fallback when no relay works."""
     remote = [
         conn for conn in connections
         if conn and conn.get("base_url")
         and not conn.get("local")
         and not _url_is_local(conn.get("base_url"))
     ]
-    # Direct remote endpoints first (faster, unmetered); relay last (fallback).
-    remote.sort(key=lambda conn: 1 if conn.get("relay") else 0)
+    remote.sort(key=lambda conn: 0 if conn.get("relay") else 1)
     return remote
 
 
@@ -394,14 +398,27 @@ def _parse_plex_connections(xml_text, server_name=None, machine_identifier=None,
         return []
     root = ET.fromstring(xml_text)
     connections = []
-    for device in root.findall(".//Device"):
+    # plex.tv /api/v2/resources returns LOWERCASE elements:
+    #   <resources><resource ...><connections><connection .../></connections></resource></resources>
+    # XML find is case-sensitive, so try the v2 shape first, then fall back to
+    # the legacy v1 shape (<Device><Connection/></Device>) for older responses.
+    devices = root.findall(".//resource")
+    if not devices:
+        devices = root.findall(".//Device")
+    for device in devices:
+        provides = str(device.attrib.get("provides") or "")
+        if provides and "server" not in provides:
+            continue
         name = device.attrib.get("name") or device.attrib.get("clientIdentifier") or ""
         client_identifier = device.attrib.get("clientIdentifier") or ""
         token = device.attrib.get("accessToken") or ""
         device_data = {"name": name, "machine_identifier": client_identifier}
         if not _connection_matches(device_data, server_name, machine_identifier):
             continue
-        for connection in device.findall(".//Connection"):
+        device_connections = device.findall(".//connection")
+        if not device_connections:
+            device_connections = device.findall(".//Connection")
+        for connection in device_connections:
             uri = connection.attrib.get("uri") or ""
             if not uri:
                 continue
@@ -452,7 +469,7 @@ def discover_plex_tv_resource(account_token, server_name=None, machine_identifie
 
 
 def discover_plex_tv_connections(account_token, server_name=None, machine_identifier=None, logger=None):
-    """Return all cloud-reachable Plex connections (direct first, then relay)."""
+    """Return all cloud-reachable Plex connections, relay endpoints before direct."""
     token = str(account_token or "").strip()
     if not token:
         return []
@@ -465,6 +482,9 @@ def discover_plex_tv_connections(account_token, server_name=None, machine_identi
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         connections = parse_remote_plex_connections(response.text, server_name, machine_identifier)
+        if logger:
+            labels = ", ".join(_connection_log_label(conn) for conn in connections) or "none"
+            logger.warning(f"[PlexAudio] Plex.tv remote connections discovered: {labels}")
         return connections
     except Exception as exc:
         if logger:
@@ -931,6 +951,29 @@ def updated_resume_state(state, elapsed_ms):
     return updated
 
 
+async def _await_if_needed(value):
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _link_state_from_value(value):
+    if isinstance(value, dict):
+        state = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            state = json.loads(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not isinstance(state, dict):
+        return None
+    if not str(state.get("token") or "").strip():
+        return None
+    return state
+
+
 def plex_error_message(base_url, exc):
     error_text = str(exc or "").lower()
     base_text = str(base_url or "")
@@ -1064,27 +1107,72 @@ class PlexAudioPlayerCapability(MatchingCapability):
         if not state:
             return
         try:
-            await self.capability_worker.write_file(PLEX_RESUME_FILE, json.dumps(state), in_ability_directory=False)
+            await _await_if_needed(
+                self.capability_worker.write_file(
+                    PLEX_RESUME_FILE,
+                    json.dumps(state),
+                    in_ability_directory=False,
+                    mode="w",
+                )
+            )
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Resume save failed: {exc}")
 
     async def _read_link_state(self):
         try:
-            if not await self.capability_worker.check_if_file_exists(PLEX_LINK_FILE, in_ability_directory=False):
+            if hasattr(self.capability_worker, "get_single_key"):
+                state = _link_state_from_value(
+                    await _await_if_needed(self.capability_worker.get_single_key(PLEX_LINK_STATE_KEY))
+                )
+                if state:
+                    return state
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Link key read failed: {exc}")
+        try:
+            if not await _await_if_needed(
+                self.capability_worker.check_if_file_exists(PLEX_LINK_FILE, in_ability_directory=False)
+            ):
                 return None
-            data = await self.capability_worker.read_file(PLEX_LINK_FILE, in_ability_directory=False)
-            return json.loads(data) if data else None
+            data = await _await_if_needed(
+                self.capability_worker.read_file(PLEX_LINK_FILE, in_ability_directory=False)
+            )
+            return _link_state_from_value(data)
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Link read failed: {exc}")
             return None
 
     async def _write_link_state(self, state):
+        state = _link_state_from_value(state)
         if not state:
-            return
+            return False
+        key_saved = False
         try:
-            await self.capability_worker.write_file(PLEX_LINK_FILE, json.dumps(state), in_ability_directory=False)
+            if hasattr(self.capability_worker, "get_single_key"):
+                existing = await _await_if_needed(self.capability_worker.get_single_key(PLEX_LINK_STATE_KEY))
+                if existing and hasattr(self.capability_worker, "update_key"):
+                    await _await_if_needed(self.capability_worker.update_key(PLEX_LINK_STATE_KEY, state))
+                    key_saved = True
+                elif hasattr(self.capability_worker, "create_key"):
+                    await _await_if_needed(self.capability_worker.create_key(PLEX_LINK_STATE_KEY, state))
+                    key_saved = True
+                elif hasattr(self.capability_worker, "update_key"):
+                    await _await_if_needed(self.capability_worker.update_key(PLEX_LINK_STATE_KEY, state))
+                    key_saved = True
+        except Exception as exc:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Link key save failed: {exc}")
+        try:
+            await _await_if_needed(
+                self.capability_worker.write_file(
+                    PLEX_LINK_FILE,
+                    json.dumps(state),
+                    in_ability_directory=False,
+                    mode="w",
+                )
+            )
+            return True
         except Exception as exc:
             self.worker.editor_logging_handler.warning(f"[PlexAudio] Link save failed: {exc}")
+            return key_saved
 
     async def _linked_token(self):
         state = await self._read_link_state()
@@ -1188,7 +1276,14 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 logger.warning(f"[PlexAudio] Plex PIN poll failed: {exc}")
                 continue
             if auth_token:
-                await self._write_link_state({"token": auth_token, "linked_at": time.time()})
+                saved = await self._write_link_state({"token": auth_token, "linked_at": time.time()})
+                saved_token = await self._linked_token()
+                if not saved or saved_token != str(auth_token).strip():
+                    logger.warning("[PlexAudio] Plex link token save/read-back failed.")
+                    await self.capability_worker.speak(
+                        "I got a Plex token, but it could not be saved. Please try linking again."
+                    )
+                    return
                 await self.capability_worker.speak(
                     "Your Plex account is linked. You can now ask me to play music or audiobooks."
                 )
@@ -1202,14 +1297,16 @@ class PlexAudioPlayerCapability(MatchingCapability):
         """Find a Plex connection the OpenHome cloud runtime can reach directly.
 
         A configured non-local base_url is probed first. Otherwise every remote
-        connection Plex.tv lists is probed in turn — direct endpoints first, then
-        the relay — returning the first that answers /identity. This is what lets
+        connection Plex.tv lists is probed in turn, relay endpoints first, then
+        direct endpoints, returning the first that answers /identity. This is what lets
         playback work behind double NAT, where the direct remote endpoint is dead
         but the Plex Relay still tunnels through."""
         logger = self.worker.editor_logging_handler
         if base_url and not _url_is_local(base_url):
+            logger.warning(f"[PlexAudio] Probing configured Plex URL: {base_url}")
             candidate = PlexAudioClient(base_url, token, logger)
             if self._probe_cloud_connection(candidate):
+                logger.warning(f"[PlexAudio] Cloud reachability succeeded for configured URL: {base_url}")
                 return candidate
         for connection in discover_plex_tv_connections(account_token, server_name=server_name, machine_identifier=machine_identifier, logger=logger):
             candidate = PlexAudioClient(
@@ -1217,7 +1314,9 @@ class PlexAudioPlayerCapability(MatchingCapability):
                 connection.get("token") or account_token,
                 logger,
             )
+            logger.warning(f"[PlexAudio] Probing Plex.tv {_connection_log_label(connection)}")
             if self._probe_cloud_connection(candidate):
+                logger.warning(f"[PlexAudio] Cloud reachability succeeded for Plex.tv {_connection_log_label(connection)}")
                 return candidate
         return None
 
@@ -1461,6 +1560,7 @@ class PlexAudioPlayerCapability(MatchingCapability):
     async def run(self):
         base_url = ""
         try:
+            self.worker.editor_logging_handler.warning(f"[PlexAudio] Build {PLEX_AUDIO_BUILD} starting")
             base_url, token, account_token, server_name, machine_identifier, missing = self._get_required_config()
 
             # Cloud-only playback: the OpenHome cloud streams audio straight from
@@ -1499,10 +1599,14 @@ class PlexAudioPlayerCapability(MatchingCapability):
             )
             if not client:
                 if not account_token:
+                    # No token yet: start linking RIGHT HERE rather than asking the
+                    # user to say "link my Plex account" — that phrase may not match
+                    # the ability's trigger words, which would strand them in a loop
+                    # of "say link my Plex account" with no way to actually trigger it.
                     await self.capability_worker.speak(
-                        "I don't have a way to reach your Plex server from the cloud yet. "
-                        "Say link my Plex account, and I'll walk you through it."
+                        "Your Plex account isn't linked yet. Let's set that up now."
                     )
+                    await self._link_plex_account()
                 else:
                     await self.capability_worker.speak(
                         "I couldn't reach your Plex server from the cloud. "
